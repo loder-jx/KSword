@@ -209,11 +209,19 @@ NTSTATUS KswordSvmValidateFlags(KSW_HVM_RUNTIME* Runtime, ULONG Flags)
         KSWORD_ARK_HVM_CONTROL_FLAG_ALLOW_NESTED | KSWORD_ARK_HVM_CONTROL_FLAG_SVM_NESTED_PROBE;
     /* Unknown/Intel-specific features must not silently degrade to baseline. */
     if (Flags & ~allowed) { return STATUS_NOT_SUPPORTED; }
-    /* Running under a VMM requires opt-in and a specifically supported outer host. */
+    /* Running under a VMM requires opt-in and a known outer host. */
     if (Runtime->FeatureFlags & KSWORD_ARK_HVM_FEATURE_HYPERVISOR_PRESENT) {
         /* Do not spoof CPUID or accept an unknown host to make entry pass. */
-        if (!(Flags & KSWORD_ARK_HVM_CONTROL_FLAG_ALLOW_NESTED) ||
-            RtlCompareMemory(Runtime->HypervisorVendor, "VMwareVMware", 12) != 12) { return STATUS_NOT_SUPPORTED; }
+        if (!(Flags & KSWORD_ARK_HVM_CONTROL_FLAG_ALLOW_NESTED)) { return STATUS_NOT_SUPPORTED; }
+        /*
+         * Known outer hosts. VMware is the validated nested environment.
+         * Microsoft Hv (a nested Hyper-V guest exposing SVM/NPT to L1) is
+         * admitted experimentally: the capability probe has already proven
+         * SVM, NPT and NRIP on this machine, but VMRUN entry under Hyper-V
+         * as the outer host has no validation evidence yet.
+         */
+        if (RtlCompareMemory(Runtime->HypervisorVendor, "VMwareVMware", 12) != 12 &&
+            RtlCompareMemory(Runtime->HypervisorVendor, "Microsoft Hv", 12) != 12) { return STATUS_NOT_SUPPORTED; }
     }
     /* All required SVM state is validated separately. */
     return STATUS_SUCCESS;
