@@ -38,6 +38,27 @@ KswordARKHvmEventPublish(
     _In_ const KSWORD_ARK_HVM_EVENT_ROW* Event
     );
 
+/*
+ * Publish one event and report whether the ring actually took it.
+ *
+ * The ring never waits in VMX root, so a publication can be dropped: the slot
+ * may be held by a wrapped writer, or a newer sequence may already own it.
+ * For routine telemetry that is a counter and nothing more, which is why the
+ * plain publisher returns nothing.
+ *
+ * A watch hit is the opposite case.  "No event" and "the event was lost" look
+ * identical in the event list but mean opposite things - the target was not
+ * touched, versus the target was touched and the evidence is gone.  A caller
+ * that has to tell those apart needs the sequence and the outcome, so it gets
+ * them here rather than inferring from a global drop counter that every other
+ * publisher also moves.
+ */
+BOOLEAN
+KswordARKHvmEventPublishTracked(
+    _In_ const KSWORD_ARK_HVM_EVENT_ROW* Event,
+    _Out_ ULONGLONG* PublishedSequence
+    );
+
 /* Snapshot a bounded event batch after one caller-provided sequence. */
 NTSTATUS
 KswordARKHvmEventQuery(

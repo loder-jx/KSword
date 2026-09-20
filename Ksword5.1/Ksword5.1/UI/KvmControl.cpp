@@ -6,11 +6,36 @@
 #include <QStringList>
 
 #include <atomic>
+// __cpuid：EPT 窗口不够时，本机的物理地址宽度要在用户态自己读。
+#include <intrin.h>
 
 namespace ksword::kvm
 {
     namespace
     {
+        // 一个 PML4 项覆盖的客户物理空间。
+        constexpr quint64 kBytesPerPml4Entry = 512ULL * 1024ULL * 1024ULL * 1024ULL;
+
+        // 本机 CPUID.80000008H:EAX[7:0] 报告的物理地址宽度；问不出来返回 0。
+        //
+        // 在用户态读：MAXPHYADDR 是一条 CPL3 就能执行的 CPUID 给出的，不需要
+        // 驱动帮忙。这一点正好是这条消息能说得准的原因——它在**驱动拒绝之后**
+        // 才需要，而那时驱动能不能配合已经不一定了。
+        unsigned long hostPhysicalAddressBits()
+        {
+            int leaves[4] = { 0, 0, 0, 0 };
+            __cpuid(leaves, static_cast<int>(0x80000000));
+            if (static_cast<unsigned int>(leaves[0]) < 0x80000008U)
+            {
+                return 0UL;
+            }
+            __cpuid(leaves, static_cast<int>(0x80000008));
+            const unsigned long bits =
+                static_cast<unsigned long>(leaves[0]) & 0xFFUL;
+            // 32 位以下和 52 位以上都不是架构上有意义的宽度，当作问不出来。
+            return (bits >= 32UL && bits <= 52UL) ? bits : 0UL;
+        }
+
         // 写权限开关的持久化键。放在 Safety/ 下与其它安全门保持一致。
         const QString kWriteAccessSettingKey =
             QStringLiteral("Safety/Kvm/WriteAccessEnabled");
@@ -321,6 +346,49 @@ namespace ksword::kvm
             case KSWORD_ARK_HVM_CONTROL_STATUS_LOCAL_EPT_CONFLICTS_WITH_NESTED:
                 reason = ks::i18n::sourceText(QStringLiteral("私有 EPT 与嵌套 VMX 互斥。请关掉其中一个"));
                 break;
+            case KSWORD_ARK_HVM_CONTROL_STATUS_EPT_WINDOW_TOO_SMALL:
+            {
+                /*
+                 * 这一条要把话说反过来：**不是处理器不支持**。
+                 *
+                 * 这个码存在之前，同一情形走的是 UNSUPPORTED_CPU，于是一台
+                 * 每项能力都齐备的 Intel Core Ultra 被告知"处理器不支持"，
+                 * 用户只能去查 CPU 和 BIOS，而那两处都没有问题。
+                 *
+                 * 三个数缺一不可：本机需要多少（CPUID，用户态自己读）、这一版
+                 * 有多少（驱动回报的 eptPml4EntryBudget，**不能**用界面自己
+                 * 编译时的常量——版本不齐时那个值恰好是错的）、以及换算成的
+                 * 地址空间大小，否则前两个数对普通用户没有意义。
+                 */
+                const unsigned long bits = hostPhysicalAddressBits();
+                const unsigned long budget =
+                    result.response.eptPml4EntryBudget;
+                const QString budgetText = budget != 0UL
+                    ? ks::i18n::sourceText(QStringLiteral("%1 项（%2 TiB）"))
+                        .arg(budget)
+                        .arg((static_cast<quint64>(budget) * kBytesPerPml4Entry)
+                                 / (1024ULL * 1024ULL * 1024ULL * 1024ULL))
+                    : ks::i18n::sourceText(QStringLiteral("未知（这个驱动版本没有回报窗口大小）"));
+                if (bits != 0UL)
+                {
+                    const quint64 needBytes = 1ULL << bits;
+                    const unsigned long needEntries = static_cast<unsigned long>(
+                        (needBytes + kBytesPerPml4Entry - 1ULL) / kBytesPerPml4Entry);
+                    reason = ks::i18n::sourceText(QStringLiteral(
+                        "本机的客户物理地址空间比这一版驱动能建的 EPT 恒等映射窗口大：CPUID 报告 %1 位物理地址（%2 TiB），需要 %3 个 512 GiB 的 PML4 项，而这个驱动的窗口是 %4。**这不是处理器不支持** —— 它每一项能力都齐备，换一个窗口更大的驱动版本即可。"))
+                        .arg(bits)
+                        .arg(needBytes / (1024ULL * 1024ULL * 1024ULL * 1024ULL))
+                        .arg(needEntries)
+                        .arg(budgetText);
+                }
+                else
+                {
+                    reason = ks::i18n::sourceText(QStringLiteral(
+                        "本机的客户物理地址空间比这一版驱动能建的 EPT 恒等映射窗口大（这个驱动的窗口是 %1；本机需要多少问不出来，CPUID 没有提供物理地址宽度叶）。**这不是处理器不支持。**"))
+                        .arg(budgetText);
+                }
+                break;
+            }
             case KSWORD_ARK_HVM_CONTROL_STATUS_SELF_TEST_FAILED:
                 reason = ks::i18n::sourceText(QStringLiteral("自检未通过"));
                 break;
@@ -386,6 +454,7 @@ namespace ksword::kvm
         }
 
         const auto& response = result.response;
+        state.backend = response.backend;
         state.generation = response.generation;
         state.processorCount = response.processorCount;
         state.residentProcessorCount = response.residentProcessorCount;
@@ -1661,6 +1730,11 @@ namespace ksword::kvm
             entry.access = row.access;
             entry.ruleId = row.ruleId;
             entry.status = row.status;
+            /* 命中现场里只能在 VM-exit 那一刻取到的两个寄存器，原样上抬。 */
+            entry.guestRsp = row.guestRsp;
+            entry.guestCr3 = row.guestCr3;
+            entry.watchState = row.watchState;
+            entry.eventFlags = row.eventFlags;
             events.events.append(entry);
         }
         return events;
@@ -1790,5 +1864,416 @@ namespace ksword::kvm
             KSWORD_ARK_HVM_CR_POLICY_OP_CLEAR,
             0, 0, false, false, false, true);
         return toCrPolicyResult(result, actionName);
+    }
+
+    namespace
+    {
+        // toProcessResult：把驱动处置响应翻译成 UI 可直接展示的结论。
+        KvmProcessResult toProcessResult(
+            const ksword::ark::HvmProcessResult& result,
+            const QString& actionName)
+        {
+            KvmProcessResult disposition;
+            disposition.protocolStatus = result.response.status;
+            disposition.lastStatus = result.response.lastStatus;
+            disposition.rowCount = result.response.rowCount;
+            disposition.ok = result.io.ok &&
+                result.response.status == KSWORD_ARK_HVM_PROCESS_STATUS_OK;
+            // 表在成功与失败时都回填：失败也要让调用方看见现在装着什么，
+            // 否则"表已满"这类拒绝只剩一个数字，没法判断该撤哪一条。
+            const unsigned long rows =
+                result.response.returnedRows <=
+                    KSWORD_ARK_HVM_MAX_PROCESS_DISPOSITIONS
+                    ? result.response.returnedRows
+                    : KSWORD_ARK_HVM_MAX_PROCESS_DISPOSITIONS;
+            for (unsigned long index = 0; index < rows; ++index)
+            {
+                const auto& row = result.response.rows[index];
+                KvmProcessDispositionEntry entry;
+                entry.processId = row.processId;
+                entry.disposition = row.disposition;
+                entry.hierarchyIndex = row.hierarchyIndex;
+                entry.directoryBase = row.directoryBase;
+                entry.guestPhysicalAddress = row.guestPhysicalAddress;
+                entry.guestLinearAddress = row.guestLinearAddress;
+                entry.interceptCount = row.interceptCount;
+                disposition.dispositions.append(entry);
+            }
+            if (disposition.ok)
+            {
+                disposition.message = ks::i18n::sourceText(
+                    QStringLiteral("%1 成功。")).arg(actionName);
+                return disposition;
+            }
+            if (!result.io.ok && result.unsupported)
+            {
+                disposition.message = ks::i18n::sourceText(
+                    QStringLiteral("%1 失败：当前驱动不提供该能力。"))
+                    .arg(actionName);
+                return disposition;
+            }
+            QString reason;
+            switch (result.response.status)
+            {
+            case KSWORD_ARK_HVM_PROCESS_STATUS_INVALID_REQUEST:
+                reason = ks::i18n::sourceText(QStringLiteral("请求不合法"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_CONFIRMATION_REQUIRED:
+                reason = ks::i18n::sourceText(QStringLiteral("需要显式确认"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_REQUIRES_RESIDENT_STOPPED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "安装处置要求常驻停着，请先停止常驻"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_PROCESS_LOOKUP_FAILED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "找不到该 PID 对应的进程"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_TABLE_FULL:
+                reason = ks::i18n::sourceText(QStringLiteral("处置表已满"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_NOT_FOUND:
+                reason = ks::i18n::sourceText(QStringLiteral("没有这条处置"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_ALREADY_ARMED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "该进程已经装着一条处置"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_CR3_TRACKING_REQUIRED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "要求先开启 CR3 追踪：处置靠地址空间认目标，没有它认不出来"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_EPTP_SWITCH_REQUIRED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "要求 EPTP 切换后端：受限层次靠切指针生效"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_TRANSLATION_FAILED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "目标线性地址翻译失败，那一页此刻不在内存里"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_PROTECTED_TARGET:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "目标受保护，驱动拒绝对它下处置"));
+                break;
+            case KSWORD_ARK_HVM_PROCESS_STATUS_NOT_PREPARED:
+                reason = ks::i18n::sourceText(QStringLiteral("资源尚未准备"));
+                break;
+            default:
+                reason = ks::i18n::sourceText(QStringLiteral("协议状态 %1"))
+                    .arg(result.response.status);
+                break;
+            }
+            disposition.message = ks::i18n::sourceText(
+                QStringLiteral("%1 失败：%2。"))
+                .arg(actionName)
+                .arg(reason);
+            return disposition;
+        }
+
+        // denyProcessWithoutWriteAccess：写权限关闭时统一拒绝，不发 IOCTL。
+        KvmProcessResult denyProcessWithoutWriteAccess(const QString& actionName)
+        {
+            KvmProcessResult disposition;
+            disposition.message = ks::i18n::sourceText(
+                QStringLiteral("%1 失败：R-1 写权限未开启。"))
+                .arg(actionName);
+            return disposition;
+        }
+
+        // toInjectResult：把驱动注入响应翻译成 UI 可直接展示的结论。
+        KvmInjectResult toInjectResult(
+            const ksword::ark::HvmInjectResult& result,
+            const QString& actionName)
+        {
+            KvmInjectResult injection;
+            injection.protocolStatus = result.response.status;
+            injection.lastStatus = result.response.lastStatus;
+            injection.rowCount = result.response.rowCount;
+            injection.ok = result.io.ok &&
+                result.response.status == KSWORD_ARK_HVM_INJECT_STATUS_OK;
+            const unsigned long rows =
+                result.response.returnedRows <= KSWORD_ARK_HVM_MAX_INJECTIONS
+                    ? result.response.returnedRows
+                    : KSWORD_ARK_HVM_MAX_INJECTIONS;
+            for (unsigned long index = 0; index < rows; ++index)
+            {
+                const auto& row = result.response.rows[index];
+                KvmInjectionEntry entry;
+                entry.processId = row.processId;
+                entry.payloadBytes = row.payloadBytes;
+                entry.directoryBase = row.directoryBase;
+                entry.guestLinearAddress = row.guestLinearAddress;
+                entry.guestPhysicalAddress = row.guestPhysicalAddress;
+                entry.caveOffset = row.caveOffset;
+                entry.caveBytes = row.caveBytes;
+                entry.executionCount = row.executionCount;
+                entry.viewId = row.viewId;
+                entry.caveFiller = row.caveFiller;
+                injection.injections.append(entry);
+            }
+            if (injection.ok)
+            {
+                injection.message = ks::i18n::sourceText(
+                    QStringLiteral("%1 成功。")).arg(actionName);
+                return injection;
+            }
+            if (!result.io.ok && result.unsupported)
+            {
+                injection.message = ks::i18n::sourceText(
+                    QStringLiteral("%1 失败：当前驱动不提供该能力。"))
+                    .arg(actionName);
+                return injection;
+            }
+            QString reason;
+            switch (result.response.status)
+            {
+            case KSWORD_ARK_HVM_INJECT_STATUS_INVALID_REQUEST:
+                reason = ks::i18n::sourceText(QStringLiteral("请求不合法"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_NOT_PREPARED:
+                reason = ks::i18n::sourceText(QStringLiteral("资源尚未准备"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_REQUIRES_RESIDENT_STOPPED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "安装注入要求常驻停着，请先停止常驻"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_PROCESS_LOOKUP_FAILED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "找不到该 PID 对应的进程"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_TRANSLATION_FAILED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "目标线性地址翻译失败，那一页此刻不在内存里"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_TABLE_FULL:
+                reason = ks::i18n::sourceText(QStringLiteral("注入表已满"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_NOT_FOUND:
+                reason = ks::i18n::sourceText(QStringLiteral("没有这条注入"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_ALREADY_ARMED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "该进程已经装着一条注入"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_PROTECTED_TARGET:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "目标受保护，驱动拒绝对它注入"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_CR3_TRACKING_REQUIRED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "要求先开启 CR3 追踪：注入靠地址空间认目标，没有它认不出来"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_EPTP_SWITCH_REQUIRED:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "要求 EPTP 切换后端：执行视图靠切指针生效"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_NO_CAVE:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "这一页里找不到足够大的空隙放外壳，换一页再试"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_VIEW_FAILED:
+                reason = ks::i18n::sourceText(QStringLiteral("执行视图安装失败"));
+                break;
+            case KSWORD_ARK_HVM_INJECT_STATUS_PAGE_NOT_EXECUTABLE:
+                reason = ks::i18n::sourceText(QStringLiteral(
+                    "这一页在目标里不可执行，劫持它不会被触发"));
+                break;
+            default:
+                reason = ks::i18n::sourceText(QStringLiteral("协议状态 %1"))
+                    .arg(result.response.status);
+                break;
+            }
+            injection.message = ks::i18n::sourceText(
+                QStringLiteral("%1 失败：%2。"))
+                .arg(actionName)
+                .arg(reason);
+            return injection;
+        }
+
+        // denyInjectWithoutWriteAccess：写权限关闭时统一拒绝，不发 IOCTL。
+        KvmInjectResult denyInjectWithoutWriteAccess(const QString& actionName)
+        {
+            KvmInjectResult injection;
+            injection.message = ks::i18n::sourceText(
+                QStringLiteral("%1 失败：R-1 写权限未开启。"))
+                .arg(actionName);
+            return injection;
+        }
+    }
+
+    KvmProcessResult listProcessDispositions()
+    {
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmProcess(
+            KSWORD_ARK_HVM_PROCESS_OP_QUERY, 0, 0, false);
+        return toProcessResult(
+            result,
+            ks::i18n::sourceText(QStringLiteral("读取 R-1 进程处置")));
+    }
+
+    KvmProcessResult freezeProcess(
+        const unsigned long processId,
+        const unsigned long long guestLinearAddress)
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("冻结进程"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyProcessWithoutWriteAccess(actionName);
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmProcess(
+            KSWORD_ARK_HVM_PROCESS_OP_FREEZE,
+            processId,
+            guestLinearAddress,
+            true);
+        return toProcessResult(result, actionName);
+    }
+
+    KvmProcessResult terminateProcess(
+        const unsigned long processId,
+        const unsigned long long guestLinearAddress)
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("结束进程"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyProcessWithoutWriteAccess(actionName);
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmProcess(
+            KSWORD_ARK_HVM_PROCESS_OP_TERMINATE,
+            processId,
+            guestLinearAddress,
+            true);
+        return toProcessResult(result, actionName);
+    }
+
+    KvmProcessResult releaseProcessDisposition(const unsigned long processId)
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("撤销进程处置"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyProcessWithoutWriteAccess(actionName);
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmProcess(
+            KSWORD_ARK_HVM_PROCESS_OP_RELEASE, processId, 0, true);
+        return toProcessResult(result, actionName);
+    }
+
+    KvmProcessResult releaseAllProcessDispositions()
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("撤销全部进程处置"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyProcessWithoutWriteAccess(actionName);
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmProcess(
+            KSWORD_ARK_HVM_PROCESS_OP_RELEASE_ALL, 0, 0, true);
+        return toProcessResult(result, actionName);
+    }
+
+    KvmInjectResult listInjections()
+    {
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmInject(
+            KSWORD_ARK_HVM_INJECT_OP_QUERY, 0, 0, 0, 0, nullptr, 0, false);
+        return toInjectResult(
+            result,
+            ks::i18n::sourceText(QStringLiteral("读取 R-1 注入")));
+    }
+
+    KvmInjectResult injectDll(
+        const unsigned long processId,
+        const unsigned long long guestLinearAddress,
+        const unsigned long long loadLibraryAddress,
+        const QString& dllPath)
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("注入 DLL"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyInjectWithoutWriteAccess(actionName);
+        }
+        // 载荷是不含结尾零的 UTF-16 路径：驱动补零，补出来的零正好是终止符。
+        // QString 本身就是 UTF-16，这里不做任何转码，也就没有转码失败这条路径。
+        const int pathBytes = dllPath.size() * static_cast<int>(sizeof(char16_t));
+        if (dllPath.isEmpty() ||
+            pathBytes > static_cast<int>(
+                KSWORD_ARK_HVM_INJECT_MAX_PAYLOAD_BYTES - sizeof(char16_t)))
+        {
+            KvmInjectResult injection;
+            injection.message = ks::i18n::sourceText(
+                QStringLiteral("%1 失败：DLL 路径为空或超出载荷上限。"))
+                .arg(actionName);
+            return injection;
+        }
+        // LoadLibraryW 给 0 时就地解析：kernel32 的 ASLR 每次启动重定一次而不是
+        // 每进程一次，所以本进程解析出来的地址对目标同样成立。解析不出来就明说
+        // ——传 0 进驱动只会换回一条"请求不合法"，指不到这一步。
+        unsigned long long resolvedLoadLibrary = loadLibraryAddress;
+        if (resolvedLoadLibrary == 0ULL)
+        {
+            const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+            const FARPROC resolved = kernel32 != nullptr
+                ? GetProcAddress(kernel32, "LoadLibraryW")
+                : nullptr;
+            if (resolved == nullptr)
+            {
+                KvmInjectResult injection;
+                injection.message = ks::i18n::sourceText(
+                    QStringLiteral("%1 失败：无法就地解析 LoadLibraryW。"))
+                    .arg(actionName);
+                return injection;
+            }
+            resolvedLoadLibrary =
+                static_cast<unsigned long long>(
+                    reinterpret_cast<ULONG_PTR>(resolved));
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmInject(
+            KSWORD_ARK_HVM_INJECT_OP_ARM,
+            processId,
+            KSWORD_ARK_HVM_INJECT_TYPE_DLL_PATH,
+            guestLinearAddress,
+            resolvedLoadLibrary,
+            reinterpret_cast<const unsigned char*>(dllPath.utf16()),
+            static_cast<unsigned long>(pathBytes),
+            true);
+        return toInjectResult(result, actionName);
+    }
+
+    KvmInjectResult releaseInjection(const unsigned long processId)
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("撤销进程注入"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyInjectWithoutWriteAccess(actionName);
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmInject(
+            KSWORD_ARK_HVM_INJECT_OP_RELEASE,
+            processId, 0, 0, 0, nullptr, 0, true);
+        return toInjectResult(result, actionName);
+    }
+
+    KvmInjectResult releaseAllInjections()
+    {
+        const QString actionName =
+            ks::i18n::sourceText(QStringLiteral("撤销全部 R-1 注入"));
+        if (!isWriteAccessEnabled())
+        {
+            return denyInjectWithoutWriteAccess(actionName);
+        }
+        ksword::ark::DriverClient client;
+        const auto result = client.controlHvmInject(
+            KSWORD_ARK_HVM_INJECT_OP_RELEASE_ALL,
+            0, 0, 0, 0, nullptr, 0, true);
+        return toInjectResult(result, actionName);
     }
 }

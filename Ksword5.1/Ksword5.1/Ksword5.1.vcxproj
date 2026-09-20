@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" DefaultTargets="Build" ToolsVersion="17.0">
   <ItemGroup Label="ProjectConfigurations">
     <ProjectConfiguration Include="Debug|x64">
@@ -458,6 +458,10 @@
     <ClCompile Include="UI\KvmViewDialog.cpp" />
     <ClCompile Include="UI\KvmDomainDialog.cpp" />
     <ClCompile Include="UI\KvmMsrPolicyDialog.cpp" />
+    <ClCompile Include="UI\KvmProcessDialog.cpp" />
+    <ClCompile Include="UI\KvmWatch.cpp" />
+    <ClCompile Include="UI\KvmWatchPanel.cpp" />
+    <ClCompile Include="UI\KvmWatchDialog.cpp" />
     <ClCompile Include="UI\KvmEventDialog.cpp" />
     <ClCompile Include="UI\KvmCrPolicyDialog.cpp" />
     <ClCompile Include="UI\CommandExecutionPopup.cpp" />
@@ -819,6 +823,8 @@
     <QtMoc Include="UI\KvmHookWizard.h" />
     <QtMoc Include="UI\KvmDomainDialog.h" />
     <QtMoc Include="UI\KvmMsrPolicyDialog.h" />
+    <QtMoc Include="UI\KvmProcessDialog.h" />
+    <QtMoc Include="UI\KvmWatchDialog.h" />
     <QtMoc Include="UI\KvmEventDialog.h" />
     <QtMoc Include="UI\KvmCrPolicyDialog.h" />
     <QtMoc Include="UI\CommandExecutionPopup.h" />
@@ -1101,18 +1107,8 @@
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <ItemGroup>
-    <ClCompile Include="ArkDriverClient\HvmCommandCatalog.c"><CompileAs>CompileAsC</CompileAs></ClCompile>
-    <ClCompile Include="ArkDriverClient\HvmCommandEngine.c"><CompileAs>CompileAsC</CompileAs></ClCompile>
-    <ClCompile Include="ArkDriverClient\HvmCommandProcess.cpp"></ClCompile>
-    <ClCompile Include="UI\KvmCommandPanel.cpp"></ClCompile>
     <ClCompile Include="UI\KvmGuestVmPanel.cpp"></ClCompile>
-    <ClInclude Include="ArkDriverClient\HvmCommandCatalog.h" />
-    <ClInclude Include="ArkDriverClient\HvmCommandProcess.h" />
-    <ClInclude Include="UI\KvmCommandPanel.h" />
     <ClInclude Include="UI\KvmGuestVmPanel.h" />
   </ItemGroup>
   <ItemGroup><ClInclude Include="..\..\shared\driver\KswordArkHvmRequest.h" /></ItemGroup>
-  <Target Name="AuditKswordHvmCommandCatalog" BeforeTargets="ClCompile">
-    <Exec Command="&quot;python&quot; &quot;$(MSBuildProjectDirectory)\..\..\tools\hvm_ctl\audit_catalog.py&quot;" />
-  </Target>
 </Project>

@@ -25,6 +25,8 @@ Environment:
 #include "hvm_event.h"
 /* The multicore start gate asks the view records whether any would flip a leaf. */
 #include "hvm_ept_view.h"
+/* Stopping residency has to retire every armed first-touch watch. */
+#include "hvm_ept.h"
 #include "hvm_vmcs.h"
 #include "hvm_descriptor.h"
 #include "../../platform/pool_compat.h"
@@ -1993,8 +1995,18 @@ KswordARKHvmResidentStart(
     /* Refuse a resident mapping whose architectural address space was clipped. */
     if ((Runtime->StateFlags &
             KSWORD_ARK_HVM_STATE_EPT_TRUNCATED) != 0UL) {
-        /* Do not enter VMX with an incomplete architectural identity map. */
-        return STATUS_NOT_SUPPORTED;
+        /*
+         * Do not enter VMX with an incomplete architectural identity map.
+         *
+         * STATUS_SECTION_TOO_BIG rather than STATUS_NOT_SUPPORTED: this is the
+         * one refusal on this path that is not about the processor, and
+         * NOT_SUPPORTED is translated to UNSUPPORTED_CPU one layer up.  A
+         * machine that supports everything here was being told its processor
+         * could not do this, permanently, because its address space was wider
+         * than our window (issue #198).  The status name is literal - the
+         * region we had to map was bigger than we can map.
+         */
+        return STATUS_SECTION_TOO_BIG;
     }
     /* Never reuse a lifecycle whose prior devirtualization is uncertain. */
     if ((Runtime->StateFlags &
@@ -2590,6 +2602,18 @@ KswordARKHvmResidentStop(
     if (!NT_SUCCESS(status)) {
         return status;
     }
+    /*
+     * Retire every armed first-touch watch before residency ends.
+     *
+     * A watch is a claim about a window in which something was watching.  Once
+     * this returns, nothing is, so a watch that stayed armed across the gap
+     * would answer "never touched" for a period it did not observe - a
+     * fabricated negative, and the most damaging kind of wrong answer this
+     * feature can give.  Done here rather than after the rendezvous because
+     * the permissions have to be restored while the processors can still be
+     * invalidated, and because an idempotent stop must clear them too.
+     */
+    KswordARKHvmEptInvalidateWatchesLocked(Runtime);
     /* Treat a fully stopped lifecycle as idempotent success. */
     if (InterlockedCompareExchange(
             &Runtime->ResidentProcessorCount,

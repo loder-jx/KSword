@@ -32,8 +32,8 @@ class QPushButton;
 class QShowEvent;
 class QTimer;
 class QTabWidget;
-class KvmCommandPanel;
 class KvmGuestVmPanel;
+class KvmWatchPanel;
 
 class KernelHvmTab;
 
@@ -54,13 +54,16 @@ public:
         ReleaseResources,
         ResetFault,
         OpenHookWizard,
-        OpenCommandPanel,
         OpenViewDialog,
         OpenDomainDialog,
         OpenMsrPolicyDialog,
         OpenCrPolicyDialog,
         OpenMemoryDialog,
-        OpenEventDialog
+        OpenEventDialog,
+        // R-1 进程处置与注入。原先只能经「完整命令面板」下达——那是把主程序
+        // 当 hvm_ctl 子进程拉起来的探针通路，已整条摘除。能力本身有专属 IOCTL，
+        // 所以改由原生面板承载，与视图 / MSR / CR 同一条分派路径。
+        OpenProcessDialog
     };
 
     // ActionHandler：请求的唯一出口。
@@ -76,7 +79,6 @@ public:
 
     void setActionHandler(ActionHandler handler);
     void setCommandOperationHandler(std::function<void(bool)> handler);
-    void showCommandPanel();
 
     // setOperationRunning：控制命令执行期间禁用本页全部入口。
     //
@@ -101,8 +103,8 @@ private:
     ActionHandler m_actionHandler;
     std::function<void(bool)> m_commandOperationHandler;
     QTabWidget* m_tabs = nullptr;
-    KvmCommandPanel* m_commandPanel = nullptr;
     KvmGuestVmPanel* m_guestVmPanel = nullptr;
+    KvmWatchPanel* m_watchPanel = nullptr;
     QTimer* m_pollTimer = nullptr;
 
     // 只留派生位而不是整个 KvmState：把 KvmControl.h 拖进本头文件，
@@ -114,6 +116,12 @@ private:
     bool m_faulted = false;            // 存在故障或待回滚，必须先重置。
     bool m_operationRunning = false;   // 由 MainWindow 推进来的命令执行中标志。
     bool m_queryInFlight = false;      // 合并并发轮询，避免请求在驱动侧堆积。
+    // m_amdBackend：当前后端是 AMD SVM/NPT。
+    //
+    // 界面结构不随它变——同一套页、同一批按钮，缺的项灰掉并说明为什么。
+    // 换一套界面的代价是两条路径各自演化，而 AMD 上真正不同的只有"哪些入口
+    // 现在还没有对应实现"这一件事，为它重画一遍界面不成比例。
+    bool m_amdBackend = false;
     QString m_availabilityText;        // 不可用时的原因，直接来自门面。
     QString m_detailText;              // 快照详情，与标题栏按钮 tooltip 同源。
 
@@ -126,7 +134,9 @@ private:
 
     QPushButton* m_prepareButton = nullptr;
     QPushButton* m_releaseButton = nullptr;
+    QPushButton* m_evidenceButton = nullptr;
     QPushButton* m_hookWizardButton = nullptr;
+    QPushButton* m_processButton = nullptr;
     QPushButton* m_viewButton = nullptr;
     QPushButton* m_domainButton = nullptr;
     QPushButton* m_msrButton = nullptr;

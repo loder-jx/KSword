@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003" ToolsVersion="4.0">
   <ItemGroup>
     <Filter Include="Source Files">
@@ -58,6 +58,12 @@
       <Filter>Header Files</Filter>
     </QtMoc>
     <QtMoc Include="UI\KvmMsrPolicyDialog.h">
+      <Filter>Header Files</Filter>
+    </QtMoc>
+    <QtMoc Include="UI\KvmProcessDialog.h">
+      <Filter>Header Files</Filter>
+    </QtMoc>
+    <QtMoc Include="UI\KvmWatchDialog.h">
       <Filter>Header Files</Filter>
     </QtMoc>
     <QtMoc Include="UI\KvmEventDialog.h">
@@ -904,6 +910,18 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="UI\KvmMsrPolicyDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\KvmProcessDialog.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\KvmWatch.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\KvmWatchPanel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="UI\KvmWatchDialog.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="UI\KvmEventDialog.cpp">
@@ -2190,14 +2208,7 @@
   </ItemGroup>
   <ItemGroup><MASM Include="OtherDock\DwmRemoteLoader.asm"><Filter>Source Files</Filter></MASM></ItemGroup>
   <ItemGroup>
-    <ClCompile Include="ArkDriverClient\HvmCommandCatalog.c"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="ArkDriverClient\HvmCommandEngine.c"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="ArkDriverClient\HvmCommandProcess.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClCompile Include="UI\KvmCommandPanel.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="UI\KvmGuestVmPanel.cpp"><Filter>Source Files</Filter></ClCompile>
-    <ClInclude Include="ArkDriverClient\HvmCommandCatalog.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="ArkDriverClient\HvmCommandProcess.h"><Filter>Header Files</Filter></ClInclude>
-    <ClInclude Include="UI\KvmCommandPanel.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="UI\KvmGuestVmPanel.h"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>
   <ItemGroup><ClInclude Include="..\..\shared\driver\KswordArkHvmRequest.h" /></ItemGroup>

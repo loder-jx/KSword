@@ -17,6 +17,30 @@ Environment:
 
 #include "hvm_ept.h"
 #include "hvm_resident.h"
+/* 首次访问监视里没有诊断面的那几件事，与离线测试共用同一份实现。 */
+#include "../../../../shared/driver/KswordArkHvmWatch.h"
+
+/*
+ * 位布局必须与共享头逐位一致，否则离线测试证明的是另一套算术。
+ *
+ * 钉在编译期而不是靠约定：这两组常量分属三个头文件（协议、驱动内部、共享纯
+ * 模块），任何一边改一位都不会产生编译错误，只会让测试和内核开始各算各的。
+ */
+C_ASSERT(KSW_HVM_WATCH_ACCESS_READ == KSWORD_ARK_HVM_EPT_ACCESS_READ);
+C_ASSERT(KSW_HVM_WATCH_ACCESS_WRITE == KSWORD_ARK_HVM_EPT_ACCESS_WRITE);
+C_ASSERT(KSW_HVM_WATCH_ACCESS_EXECUTE == KSWORD_ARK_HVM_EPT_ACCESS_EXECUTE);
+C_ASSERT(KSW_HVM_WATCH_LEAF_READ == KSW_EPT_READ);
+C_ASSERT(KSW_HVM_WATCH_LEAF_WRITE == KSW_EPT_WRITE);
+C_ASSERT(KSW_HVM_WATCH_LEAF_EXECUTE == KSW_EPT_EXECUTE);
+C_ASSERT(KSW_HVM_WATCH_STATE_ARMED == KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED);
+C_ASSERT(KSW_HVM_WATCH_STATE_TRIGGERED ==
+    KSWORD_ARK_HVM_EPT_WATCH_STATE_TRIGGERED);
+C_ASSERT(KSW_HVM_WATCH_STATE_DISARMED ==
+    KSWORD_ARK_HVM_EPT_WATCH_STATE_DISARMED);
+C_ASSERT(KSW_HVM_WATCH_STATE_INVALIDATED ==
+    KSWORD_ARK_HVM_EPT_WATCH_STATE_INVALIDATED);
+C_ASSERT(KSW_HVM_WATCH_STATE_FAULTED ==
+    KSWORD_ARK_HVM_EPT_WATCH_STATE_FAULTED);
 
 /* Return the active split that owns one two-MiB physical range. */
 static KSW_HVM_EPT_SPLIT*
@@ -345,6 +369,69 @@ KswordARKHvmEptRecomputePageLocked(
     *entry = value;
 }
 
+/*
+ * Compute what one page's leaf value becomes once a given rule stops denying.
+ *
+ * Deliberately not "read DeniedAccess after the winner cleared it": the
+ * processor that loses the atomic transition can reach this point before the
+ * winner's store is visible to it, and a recompute that still sees the denial
+ * would restore the restricted value, resume, fault again, and keep doing that
+ * until the store lands.  Excluding the rule by identity removes the ordering
+ * question entirely - every processor computes the same final value no matter
+ * when it arrives.
+ *
+ * VM-exit safe: it reads only the rule table and the split ledger, both of
+ * which residency freezes, and it takes no lock.
+ */
+static ULONGLONG
+KswordARKHvmEptComputeLeafExcluding(
+    _In_ const KSW_HVM_RUNTIME* Runtime,
+    _In_ ULONGLONG PhysicalAddress,
+    _In_ ULONGLONG CurrentValue,
+    _In_ const KSW_HVM_EPT_RULE_SLOT* Excluded
+    )
+{
+    ULONGLONG value = KswordArkHvmWatchRestoreLeaf(CurrentValue);
+    ULONG ruleIndex = 0UL;
+
+    /* Apply each bounded active rule that still contains the physical page. */
+    for (ruleIndex = 0UL;
+         ruleIndex < KSWORD_ARK_HVM_MAX_EPT_RULES;
+         ++ruleIndex) {
+        const KSW_HVM_EPT_RULE_SLOT* rule =
+            &Runtime->EptRules[ruleIndex];
+        ULONGLONG ruleBytes = 0ULL;
+        ULONGLONG ruleEnd = 0ULL;
+
+        /* Skip inactive rule records. */
+        if (!rule->Active) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Skip the rule whose denial this computation is removing. */
+        if (rule == Excluded) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Convert the validated page count to bytes. */
+        ruleBytes = rule->PageCount * KSW_HVM_PAGE_BYTES;
+        /* Compute the validated exclusive rule end. */
+        ruleEnd = rule->PhysicalAddress + ruleBytes;
+        /* Skip rules that do not contain the target page. */
+        if (PhysicalAddress < rule->PhysicalAddress ||
+            PhysicalAddress >= ruleEnd) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Remove exactly the permissions this overlapping rule denies. */
+        value = KswordArkHvmWatchApplyDenial(
+            value,
+            rule->DeniedAccess);
+    }
+    /* Return the permission value the page settles on. */
+    return value;
+}
+
 /* Recompute every page in one validated rule range. */
 static VOID
 KswordARKHvmEptRecomputeRangeLocked(
@@ -444,6 +531,205 @@ KswordARKHvmEptResetLocked(
     KswordARKHvmStateClear(Runtime, KSWORD_ARK_HVM_STATE_EPT_RULES_ACTIVE);
 }
 
+/* Publish one watch slot as a protocol row. */
+static VOID
+KswordARKHvmEptFillWatchRow(
+    _In_ const KSW_HVM_EPT_RULE_SLOT* Slot,
+    _Out_ KSWORD_ARK_HVM_EPT_WATCH_ROW* Row
+    )
+{
+    /* Initialize the complete row before publishing any field. */
+    RtlZeroMemory(Row, sizeof(*Row));
+    /* Publish the watch identity, which is the rule identity. */
+    Row->watchId = Slot->RuleId;
+    /* Publish the lifecycle state read once, not re-read per field. */
+    Row->state = (ULONG)InterlockedCompareExchange(
+        (volatile LONG*)&Slot->WatchState,
+        0L,
+        0L);
+    /* Publish the requested and normalized access masks side by side. */
+    Row->requestedAccess = Slot->WatchRequestedAccess;
+    Row->effectiveAccess = Slot->WatchEffectiveAccess;
+    Row->addressKind = Slot->WatchAddressKind;
+    Row->hitCount = Slot->WatchHitCount;
+    Row->lastHitSequence = Slot->WatchLastHitSequence;
+    Row->lastHitStatus = Slot->WatchLastHitStatus;
+    Row->armedGeneration = Slot->WatchArmedGeneration;
+    /* Publish the requested target next to the page actually watched. */
+    Row->requestedAddress = Slot->WatchRequestedAddress;
+    Row->requestedLength = Slot->WatchRequestedLength;
+    Row->physicalPage = Slot->PhysicalAddress;
+    Row->pageCount = Slot->PageCount;
+    /* Publish the recorded hit scene. */
+    Row->lastHitRip = Slot->WatchLastHitRip;
+    Row->lastHitGuestLinearAddress = Slot->WatchLastHitGuestLinearAddress;
+    Row->lastHitGuestPhysicalAddress = Slot->WatchLastHitGuestPhysicalAddress;
+    Row->lastHitCr3 = Slot->WatchLastHitCr3;
+    Row->lastHitRsp = Slot->WatchLastHitRsp;
+    Row->lastHitTimestamp = Slot->WatchLastHitTimestamp;
+    Row->lastHitProcessorGroup = Slot->WatchLastHitProcessorGroup;
+    Row->lastHitProcessorNumber = Slot->WatchLastHitProcessorNumber;
+    Row->lastHitGuestLinearValid = Slot->WatchLastHitGuestLinearValid;
+    Row->lastHitRangeMatch = Slot->WatchLastHitRangeMatch;
+}
+
+/*
+ * Report whether any other EPT mechanism already owns one physical page.
+ *
+ * Refusing instead of merging is deliberate.  A view and a watch want opposite
+ * values in the same leaf: the view keeps a restricted primary value in place
+ * permanently, while the watch restores full permissions the first time it is
+ * hit.  Whichever writes last wins, and it wins silently - the other feature
+ * simply stops working with nothing anywhere reporting why.  One page, one
+ * owner, and the conflict named in the response.
+ */
+static BOOLEAN
+KswordARKHvmEptPageHasOwner(
+    _In_ const KSW_HVM_RUNTIME* Runtime,
+    _In_ ULONGLONG PhysicalPage,
+    _In_opt_ const KSW_HVM_EPT_RULE_SLOT* IgnoredRule,
+    _Out_ ULONG* OwnerId,
+    _Out_ ULONG* OwnerKind
+    )
+{
+    ULONG index = 0UL;
+
+    /* Publish no owner before the bounded scans. */
+    *OwnerId = 0UL;
+    *OwnerKind = KSWORD_ARK_HVM_WATCH_CONFLICT_NONE;
+    /* Scan every installed split view. */
+    for (index = 0UL;
+         index < KSWORD_ARK_HVM_MAX_VIEWS;
+         ++index) {
+        const KSW_HVM_EPT_VIEW_SLOT* view =
+            &Runtime->EptViews[index];
+
+        /* Skip inactive or nonoverlapping views. */
+        if (!view->Active ||
+            view->PhysicalAddress != PhysicalPage) {
+            /* Continue to the next bounded view record. */
+            continue;
+        }
+        /* Publish the conflicting view identity. */
+        *OwnerId = view->ViewId;
+        *OwnerKind = KSWORD_ARK_HVM_WATCH_CONFLICT_VIEW;
+        /* Report that the page already has an owner. */
+        return TRUE;
+    }
+    /* Scan every active rule, including other watches. */
+    for (index = 0UL;
+         index < KSWORD_ARK_HVM_MAX_EPT_RULES;
+         ++index) {
+        const KSW_HVM_EPT_RULE_SLOT* rule =
+            &Runtime->EptRules[index];
+        ULONGLONG ruleEnd = 0ULL;
+
+        /* Skip inactive slots and the caller's own record. */
+        if (!rule->Active ||
+            rule == IgnoredRule) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Compute the validated exclusive rule end. */
+        ruleEnd = rule->PhysicalAddress +
+            (rule->PageCount * KSW_HVM_PAGE_BYTES);
+        /* Skip rules that do not contain the page. */
+        if (PhysicalPage < rule->PhysicalAddress ||
+            PhysicalPage >= ruleEnd) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Publish the conflicting rule identity and its kind. */
+        *OwnerId = rule->RuleId;
+        *OwnerKind = (rule->Flags &
+            KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL
+            ? KSWORD_ARK_HVM_WATCH_CONFLICT_WATCH
+            : KSWORD_ARK_HVM_WATCH_CONFLICT_RULE;
+        /* Report that the page already has an owner. */
+        return TRUE;
+    }
+    /* Report a page with exactly one prospective owner. */
+    return FALSE;
+}
+
+/* Find one active watch by identifier. */
+static KSW_HVM_EPT_RULE_SLOT*
+KswordARKHvmEptFindWatch(
+    _Inout_ KSW_HVM_RUNTIME* Runtime,
+    _In_ ULONG WatchId
+    )
+{
+    ULONG index = 0UL;
+
+    /* Scan every bounded rule record for one active watch. */
+    for (index = 0UL;
+         index < KSWORD_ARK_HVM_MAX_EPT_RULES;
+         ++index) {
+        KSW_HVM_EPT_RULE_SLOT* rule =
+            &Runtime->EptRules[index];
+
+        /* Select the active watch whose identifier matches exactly. */
+        if (rule->Active &&
+            (rule->Flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL &&
+            rule->RuleId == WatchId) {
+            /* Return the selected watch record. */
+            return rule;
+        }
+    }
+    /* Report that no active watch carries that identifier. */
+    return NULL;
+}
+
+VOID
+KswordARKHvmEptInvalidateWatchesLocked(
+    _Inout_ KSW_HVM_RUNTIME* Runtime
+    )
+{
+    ULONG index = 0UL;
+
+    /* Reject a missing runtime during defensive teardown. */
+    if (Runtime == NULL) {
+        /* Return without dereferencing an invalid runtime. */
+        return;
+    }
+    /* Retire every armed watch that this residency will stop observing. */
+    for (index = 0UL;
+         index < KSWORD_ARK_HVM_MAX_EPT_RULES;
+         ++index) {
+        KSW_HVM_EPT_RULE_SLOT* rule =
+            &Runtime->EptRules[index];
+
+        /* Skip inactive slots and every non-watch rule. */
+        if (!rule->Active ||
+            (rule->Flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) == 0UL) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /*
+         * Only ARMED watches change.  A DISARMED one already produced its
+         * evidence and that evidence stays true regardless of what residency
+         * does next; overwriting it would erase a real observation.
+         */
+        if (InterlockedCompareExchange(
+                &rule->WatchState,
+                (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_INVALIDATED,
+                (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED) !=
+            (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED) {
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Stop denying: the page must not stay restricted with nobody looking. */
+        rule->DeniedAccess = 0UL;
+        /* Restore the page against every rule that still denies it. */
+        KswordARKHvmEptRecomputeRangeLocked(
+            Runtime,
+            rule->PhysicalAddress,
+            rule->PageCount);
+    }
+}
+
 NTSTATUS
 KswordARKHvmEptRuleControlLocked(
     _Inout_ KSW_HVM_RUNTIME* Runtime,
@@ -538,6 +824,51 @@ KswordARKHvmEptRuleControlLocked(
         /* Return the protocol-level result successfully. */
         return STATUS_SUCCESS;
     }
+    /* Return the whole watch table without mutating EPT state. */
+    if (Request->operation ==
+            KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY) {
+        ULONG returned = 0UL;
+        ULONG total = 0UL;
+
+        /* Publish every active watch up to the bounded row capacity. */
+        for (slotIndex = 0UL;
+             slotIndex < KSWORD_ARK_HVM_MAX_EPT_RULES;
+             ++slotIndex) {
+            const KSW_HVM_EPT_RULE_SLOT* rule =
+                &Runtime->EptRules[slotIndex];
+
+            /* Skip inactive slots and every non-watch rule. */
+            if (!rule->Active ||
+                (rule->Flags &
+                    KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) == 0UL) {
+                /* Continue to the next bounded rule record. */
+                continue;
+            }
+            /* Count every watch, including ones past the row capacity. */
+            total += 1UL;
+            /* Publish only as many rows as the fixed response can carry. */
+            if (returned < KSWORD_ARK_HVM_MAX_EPT_WATCH_ROWS) {
+                /* Publish one complete watch snapshot. */
+                KswordARKHvmEptFillWatchRow(
+                    rule,
+                    &Response->watchRows[returned]);
+                /* Advance the bounded published row count. */
+                returned += 1UL;
+            }
+        }
+        /* Publish the published and total counts separately. */
+        Response->returnedWatchRows = returned;
+        Response->watchRowCount = total;
+        /* Publish the successful snapshot status. */
+        Response->status = KSWORD_ARK_HVM_EPT_RULE_STATUS_OK;
+        Response->lastStatus = STATUS_SUCCESS;
+        /* Publish the complete current rule count. */
+        Response->ruleCount = Runtime->EptRuleCount;
+        /* Publish the current lifecycle generation. */
+        Response->generation = Runtime->Generation;
+        /* Return the protocol-level result successfully. */
+        return STATUS_SUCCESS;
+    }
     /* Require typed UI confirmation for every EPT mutation. */
     if ((Request->flags &
             KSWORD_ARK_HVM_EPT_RULE_FLAG_UI_CONFIRMED) == 0UL ||
@@ -559,6 +890,85 @@ KswordARKHvmEptRuleControlLocked(
             KSWORD_ARK_HVM_EPT_RULE_STATUS_INVALID_REQUEST;
         /* Publish the authoritative compare-before failure. */
         Response->lastStatus = STATUS_REVISION_MISMATCH;
+        /* Return a protocol-level result successfully. */
+        return STATUS_SUCCESS;
+    }
+    /* Re-arm one watch that already fired, keeping its identity and history. */
+    if (Request->operation == KSWORD_ARK_HVM_EPT_RULE_REARM) {
+        ULONG conflictOwnerId = 0UL;
+        ULONG conflictOwnerKind = 0UL;
+
+        /* Locate the exact active watch. */
+        slot = KswordARKHvmEptFindWatch(
+            Runtime,
+            Request->ruleId);
+        /* Report a missing watch explicitly. */
+        if (slot == NULL) {
+            /* Publish the stable not-found protocol status. */
+            Response->status =
+                KSWORD_ARK_HVM_EPT_RULE_STATUS_NOT_FOUND;
+            /* Publish the authoritative NTSTATUS. */
+            Response->lastStatus = STATUS_NOT_FOUND;
+            /* Return a protocol-level result successfully. */
+            return STATUS_SUCCESS;
+        }
+        /*
+         * Re-arming, like arming, happens while residency is stopped: the
+         * caller never reaches here otherwise, because the rule table is
+         * frozen for the whole of residency.
+         */
+        /* Refuse to re-arm onto a page another mechanism has since claimed. */
+        if (KswordARKHvmEptPageHasOwner(
+                Runtime,
+                slot->PhysicalAddress,
+                slot,
+                &conflictOwnerId,
+                &conflictOwnerKind)) {
+            /* Publish the stable leaf-conflict protocol status. */
+            Response->status =
+                KSWORD_ARK_HVM_EPT_RULE_STATUS_LEAF_CONFLICT;
+            /* Publish which mechanism owns the page instead. */
+            Response->conflictOwnerId = conflictOwnerId;
+            Response->conflictOwnerKind = conflictOwnerKind;
+            /* Publish the authoritative conflict failure. */
+            Response->lastStatus = STATUS_SHARING_VIOLATION;
+            /* Return a protocol-level result successfully. */
+            return STATUS_SUCCESS;
+        }
+        /* Restore the normalized tripwire mask this watch was installed with. */
+        slot->DeniedAccess = slot->WatchEffectiveAccess;
+        /* Advance the lifecycle generation before binding the watch to it. */
+        Runtime->Generation += 1UL;
+        /* Bind this armed round to the generation that will observe it. */
+        slot->WatchArmedGeneration = Runtime->Generation;
+        /* Order every field before the state becomes observable to VMX root. */
+        KeMemoryBarrier();
+        /* Publish the armed lifecycle state. */
+        InterlockedExchange(
+            &slot->WatchState,
+            (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED);
+        /* Apply the restored denial to every covered page. */
+        KswordARKHvmEptRecomputeRangeLocked(
+            Runtime,
+            slot->PhysicalAddress,
+            slot->PageCount);
+        /* Invalidate resident EPT translations on every active processor. */
+        status = KswordARKHvmResidentInvalidateEpt(
+            Runtime->EptPointer);
+        /* Publish success or an explicit partial invalidation result. */
+        Response->status = NT_SUCCESS(status)
+            ? KSWORD_ARK_HVM_EPT_RULE_STATUS_OK
+            : KSWORD_ARK_HVM_EPT_RULE_STATUS_PARTIAL;
+        /* Publish the re-armed watch identity and its complete snapshot. */
+        Response->ruleId = slot->RuleId;
+        Response->deniedAccess = slot->DeniedAccess;
+        Response->flags = slot->Flags;
+        Response->physicalAddress = slot->PhysicalAddress;
+        Response->pageCount = slot->PageCount;
+        Response->ruleCount = Runtime->EptRuleCount;
+        Response->generation = Runtime->Generation;
+        Response->lastStatus = status;
+        KswordARKHvmEptFillWatchRow(slot, &Response->watch);
         /* Return a protocol-level result successfully. */
         return STATUS_SUCCESS;
     }
@@ -667,19 +1077,80 @@ KswordARKHvmEptRuleControlLocked(
          * also removes WRITE.  When execute-only EPT is unavailable, remove
          * EXECUTE as well rather than publishing an illegal R=0/W=0/X=1 leaf.
          */
-        effectiveDeniedAccess = Request->deniedAccess;
-        /* Normalize every read tripwire to a legal EPT permission tuple. */
-        if ((effectiveDeniedAccess &
-                KSWORD_ARK_HVM_EPT_ACCESS_READ) != 0UL) {
-            /* Prevent the architecturally invalid write-without-read state. */
-            effectiveDeniedAccess |=
-                KSWORD_ARK_HVM_EPT_ACCESS_WRITE;
-            /* Prevent execute-only leaves when the CPU does not support them. */
-            if ((Runtime->VmxEptVpidCapabilities &
-                    KSW_EPT_CAP_EXECUTE_ONLY) == 0ULL) {
-                /* Fall back to a no-access tripwire on this processor. */
-                effectiveDeniedAccess |=
-                    KSWORD_ARK_HVM_EPT_ACCESS_EXECUTE;
+        /*
+         * Normalization lives in the shared pure header so the offline suite
+         * proves the same code the exit path runs.  Getting it wrong has no
+         * diagnostic surface in either direction: too little and the leaf is
+         * architecturally illegal (one anonymous exit reason 49), too much and
+         * the watch silently covers more than the user asked for.
+         */
+        effectiveDeniedAccess = KswordArkHvmWatchNormalizeAccess(
+            Request->deniedAccess,
+            (Runtime->VmxEptVpidCapabilities &
+                KSW_EPT_CAP_EXECUTE_ONLY) != 0ULL);
+        /* Validate everything that is specific to a first-touch watch. */
+        if ((Request->flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL) {
+            ULONG conflictOwnerId = 0UL;
+            ULONG conflictOwnerKind = 0UL;
+
+            /*
+             * A watch covers exactly one page.
+             *
+             * Not a limitation being papered over: the hit path restores
+             * permissions from VMX root, and that work has to stay bounded by
+             * a constant rather than by whatever range a caller asked for.
+             * One page is also the honest unit - EPT permissions are page
+             * granular, so a multi-page watch would be several independent
+             * watches wearing one identifier, with one shared hit count that
+             * could not say which page was touched.
+             */
+            if (Request->pageCount != 1ULL ||
+                (Request->flags &
+                    (KSWORD_ARK_HVM_EPT_RULE_FLAG_ENFORCE |
+                     KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE)) != 0UL) {
+                /* Publish the stable invalid-request protocol status. */
+                Response->status =
+                    KSWORD_ARK_HVM_EPT_RULE_STATUS_INVALID_REQUEST;
+                /* Publish the authoritative parameter failure. */
+                Response->lastStatus = STATUS_INVALID_PARAMETER;
+                /* Return a protocol-level result successfully. */
+                return STATUS_SUCCESS;
+            }
+            /*
+             * A watch is armed while residency is STOPPED, exactly like every
+             * other EPT rule, and takes effect when residency starts.
+             *
+             * An earlier version refused a watch unless residency was already
+             * running, reasoning that a tripwire nothing can trip is worse than
+             * a refusal.  That reasoning produced a rule that could never be
+             * installed at all: KswordARKHvmEptRuleControl deliberately freezes
+             * the whole rule table while resident, because VM exits scan it
+             * without taking the PASSIVE_LEVEL lock.  The two conditions were
+             * mutually exclusive.
+             *
+             * The honest fix is not to weaken that freeze - it is a real
+             * safety invariant - but to drop the extra gate and let the state
+             * be visible instead: an armed watch with residency stopped reads
+             * as exactly that, and the callers say so.
+             */
+            /* Refuse a page another EPT mechanism already owns. */
+            if (KswordARKHvmEptPageHasOwner(
+                    Runtime,
+                    Request->physicalAddress,
+                    NULL,
+                    &conflictOwnerId,
+                    &conflictOwnerKind)) {
+                /* Publish the stable leaf-conflict protocol status. */
+                Response->status =
+                    KSWORD_ARK_HVM_EPT_RULE_STATUS_LEAF_CONFLICT;
+                /* Publish which mechanism owns the page instead. */
+                Response->conflictOwnerId = conflictOwnerId;
+                Response->conflictOwnerKind = conflictOwnerKind;
+                /* Publish the authoritative conflict failure. */
+                Response->lastStatus = STATUS_SHARING_VIOLATION;
+                /* Return a protocol-level result successfully. */
+                return STATUS_SUCCESS;
             }
         }
         /* Reserve one free bounded rule slot. */
@@ -794,7 +1265,60 @@ KswordARKHvmEptRuleControlLocked(
         slot->Flags = Request->flags &
             (KSWORD_ARK_HVM_EPT_RULE_FLAG_LOG |
              KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE |
-             KSWORD_ARK_HVM_EPT_RULE_FLAG_ENFORCE);
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_ENFORCE |
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE);
+        /* Initialize the complete watch record for every rule. */
+        slot->WatchState = (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_NONE;
+        slot->WatchRequestedAccess = 0UL;
+        slot->WatchEffectiveAccess = 0UL;
+        slot->WatchAddressKind = 0UL;
+        slot->WatchHitCount = 0UL;
+        slot->WatchLastHitStatus = KSWORD_ARK_HVM_EPT_WATCH_HIT_NONE;
+        slot->WatchArmedGeneration = 0UL;
+        slot->WatchRequestedAddress = 0ULL;
+        slot->WatchRequestedLength = 0ULL;
+        slot->WatchLastHitSequence = 0ULL;
+        slot->WatchLastHitRip = 0ULL;
+        slot->WatchLastHitGuestLinearAddress = 0ULL;
+        slot->WatchLastHitGuestPhysicalAddress = 0ULL;
+        slot->WatchLastHitCr3 = 0ULL;
+        slot->WatchLastHitRsp = 0ULL;
+        slot->WatchLastHitTimestamp = 0ULL;
+        slot->WatchLastHitProcessorGroup = 0U;
+        slot->WatchLastHitProcessorNumber = 0U;
+        slot->WatchLastHitGuestLinearValid = 0U;
+        slot->WatchLastHitRangeMatch = 0UL;
+        /* Populate the watch record only for a first-touch watch. */
+        if ((slot->Flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL) {
+            /*
+             * Keep the user's request next to the mask actually installed.
+             * They differ whenever architectural normalization widened the
+             * request - and a UI that shows only one of them either rewrites
+             * what the user asked for or understates what is being watched.
+             */
+            slot->WatchRequestedAccess = Request->deniedAccess;
+            slot->WatchEffectiveAccess = effectiveDeniedAccess;
+            slot->WatchAddressKind = Request->addressKind;
+            /*
+             * Default the requested range to the whole page when the caller
+             * gave none, so range matching reports MATCH rather than a
+             * silent miss for a caller that watched a page on purpose.
+             */
+            slot->WatchRequestedAddress =
+                Request->requestedLength != 0ULL
+                    ? Request->requestedAddress
+                    : Request->physicalAddress;
+            slot->WatchRequestedLength =
+                Request->requestedLength != 0ULL
+                    ? Request->requestedLength
+                    : KSW_HVM_PAGE_BYTES;
+            /* Bind this armed round to the generation advanced below. */
+            slot->WatchArmedGeneration = Runtime->Generation + 1UL;
+            /* Publish the armed lifecycle state. */
+            slot->WatchState =
+                (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED;
+        }
         /*
          * Durable denial and a one-instruction grant are opposite outcomes for
          * the same access.  Let denial win rather than storing a rule whose
@@ -848,6 +1372,13 @@ KswordARKHvmEptRuleControlLocked(
     if (assignedRuleId != 0UL) {
         /* Return the normalized mask applied to the new rule. */
         Response->deniedAccess = effectiveDeniedAccess;
+        /* Return the complete watch snapshot the caller will display. */
+        if (slot != NULL &&
+            (slot->Flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL) {
+            /* Publish one armed watch row. */
+            KswordARKHvmEptFillWatchRow(slot, &Response->watch);
+        }
     }
     /* Publish the current active rule count. */
     Response->ruleCount = Runtime->EptRuleCount;
@@ -915,12 +1446,14 @@ BOOLEAN
 KswordARKHvmEptHandleViolation(
     _Inout_ KSW_HVM_RUNTIME* Runtime,
     _In_ ULONGLONG GuestPhysicalAddress,
+    _In_ ULONGLONG GuestLinearAddress,
     _In_ ULONG Access,
     _In_ BOOLEAN GuestLinearAddressValid,
     _In_opt_ const KSW_HVM_EPT_LOCAL* Local,
     _Out_ KSW_HVM_EPT_TRANSIENT* Transient,
     _Out_ ULONG* RuleId,
-    _Out_ ULONG* Disposition
+    _Out_ ULONG* Disposition,
+    _Out_ KSW_HVM_EPT_WATCH_HIT* WatchHit
     )
 {
     ULONGLONG physicalPage =
@@ -931,6 +1464,9 @@ KswordARKHvmEptHandleViolation(
     BOOLEAN matched = FALSE;
     BOOLEAN allAllowOnce = TRUE;
     BOOLEAN enforceMatched = FALSE;
+    /* Set by any non-watch rule, so a watch never shares a disposition. */
+    BOOLEAN otherMatched = FALSE;
+    KSW_HVM_EPT_RULE_SLOT* watchSlot = NULL;
     volatile ULONGLONG* entry = NULL;
     ULONGLONG grantedValue = 0ULL;
 
@@ -938,7 +1474,8 @@ KswordARKHvmEptHandleViolation(
     if (Runtime == NULL ||
         Transient == NULL ||
         RuleId == NULL ||
-        Disposition == NULL) {
+        Disposition == NULL ||
+        WatchHit == NULL) {
         /* Report an unhandled fatal EPT violation. */
         return FALSE;
     }
@@ -946,6 +1483,12 @@ KswordARKHvmEptHandleViolation(
     *Disposition = KSW_HVM_EPT_DISPOSITION_DEVIRTUALIZE;
     /* Publish no new rule match before the bounded rule scan. */
     *RuleId = 0UL;
+    /* Publish an empty watch result before any rule is examined. */
+    WatchHit->FirstHit = FALSE;
+    WatchHit->RangeMatch = FALSE;
+    WatchHit->Reserved0[0] = 0U;
+    WatchHit->Reserved0[1] = 0U;
+    WatchHit->WatchId = 0UL;
     /*
      * A second violation before MTF must restore the first grant and then
      * devirtualize.  Never overwrite the only recovery record.
@@ -972,7 +1515,7 @@ KswordARKHvmEptHandleViolation(
     for (index = 0UL;
          index < KSWORD_ARK_HVM_MAX_EPT_RULES;
          ++index) {
-        const KSW_HVM_EPT_RULE_SLOT* rule =
+        KSW_HVM_EPT_RULE_SLOT* rule =
             &Runtime->EptRules[index];
         ULONGLONG ruleBytes = 0ULL;
         ULONGLONG ruleEnd = 0ULL;
@@ -1005,6 +1548,24 @@ KswordARKHvmEptHandleViolation(
         /* Publish that at least one rule covers this exact attempted access. */
         matched = TRUE;
         /*
+         * A watch resolves on its own, after the scan, and never mixes with
+         * the other three dispositions: installation already refuses a watch
+         * on a page any of them owns, so seeing both here would mean the
+         * table is inconsistent - and then the conservative outcome wins.
+         */
+        if ((rule->Flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL) {
+            /* Preserve the first watch as the authoritative hit owner. */
+            if (watchSlot == NULL) {
+                /* Select the watch this violation belongs to. */
+                watchSlot = rule;
+            }
+            /* Continue to the next bounded rule record. */
+            continue;
+        }
+        /* Publish that a non-watch rule also covers this access. */
+        otherMatched = TRUE;
+        /*
          * A durable denial neither grants a temporary permission nor tears
          * down residency, so it is tracked separately from the tripwire and
          * allow-once dispositions and resolved after the whole scan.
@@ -1032,6 +1593,163 @@ KswordARKHvmEptHandleViolation(
             /* Prevent any temporary grant for the aggregate rule set. */
             allAllowOnce = FALSE;
         }
+    }
+    /*
+     * First-touch watch.
+     *
+     * Resolved before every other disposition and only when no other rule
+     * covers the same access, because a watch means "let it through and tell
+     * me who did it" while the others mean "stop", "deny" or "step".  Mixing
+     * them would silently turn one into the other.
+     */
+    if (watchSlot != NULL &&
+        !otherMatched) {
+        LONG previousState = 0L;
+        KSW_HVM_WATCH_HIT_PLAN plan = { 0 };
+        volatile ULONGLONG* watchEntry = NULL;
+        ULONGLONG restoredValue = 0ULL;
+        ULONGLONG invalidatePointer = 0ULL;
+
+        /* Publish the watch identity as the authoritative rule evidence. */
+        selectedRuleId = watchSlot->RuleId;
+        *RuleId = selectedRuleId;
+        WatchHit->WatchId = selectedRuleId;
+        /*
+         * Decide the single owner of this first touch.
+         *
+         * Every processor that faults on the page still has to repair its own
+         * view below - only the one that wins here records evidence and moves
+         * the lifecycle.  Losers that merely resumed would fault again on the
+         * same instruction until the winner's store reached them.
+         */
+        previousState = InterlockedCompareExchange(
+            &watchSlot->WatchState,
+            (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_TRIGGERED,
+            (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED);
+        /*
+         * The decision itself lives in the shared pure header, exhaustively
+         * tested offline.  Both ways of getting it wrong are silent: two
+         * processors each believing they are the first touch produces two
+         * contradictory "first" records, and a loser that resumes without
+         * repairing its own view re-faults on the same instruction until the
+         * winner's store reaches it - a livelock with no error code at all.
+         */
+        plan = KswordArkHvmWatchPlanHit((ULONG)previousState);
+        /* Refuse to continue from a lifecycle state this path cannot explain. */
+        if (!plan.Accepted) {
+            /* Report that the dispatcher must leave EPT enforcement. */
+            return FALSE;
+        }
+        /* Record which processor owns the one logical first touch. */
+        WatchHit->FirstHit = plan.OwnsFirstHit != 0U;
+        /* Stop denying before anything recomputes the page from the table. */
+        if (WatchHit->FirstHit) {
+            /*
+             * Clearing the mask is the representation of "disarmed": both the
+             * scan above and the recompute below read it, so one store retires
+             * the tripwire everywhere without a second state to keep in sync.
+             */
+            watchSlot->DeniedAccess = 0UL;
+            /* Order the retirement before any permission is restored. */
+            KeMemoryBarrier();
+        }
+        /* Resolve the preallocated writable four-KiB leaf for this page. */
+        watchEntry = KswordARKHvmEptFindLeafEntry(
+            Runtime,
+            physicalPage);
+        /* Fail closed when split metadata is unexpectedly unavailable. */
+        if (watchEntry == NULL) {
+            /* Report that the resident dispatcher must devirtualize. */
+            return FALSE;
+        }
+        /* Compute the value the page settles on once this watch stops denying. */
+        restoredValue = KswordARKHvmEptComputeLeafExcluding(
+            Runtime,
+            physicalPage,
+            *watchEntry,
+            watchSlot);
+        /*
+         * Publish into the shared table first so that a later passive-level
+         * recompute agrees with what the processors are already using.
+         */
+        *watchEntry = restoredValue;
+        /* Repair this processor's own mirror when it runs a private hierarchy. */
+        if (Local != NULL) {
+            volatile ULONGLONG* localEntry =
+                KswordARKHvmEptLocalTranslate(Local, watchEntry);
+
+            /* Fail closed rather than leave this processor still denied. */
+            if (localEntry == NULL) {
+                /* Report that the resident dispatcher must devirtualize. */
+                return FALSE;
+            }
+            /* Restore the permission in the hierarchy this processor walks. */
+            *localEntry = restoredValue;
+            /* Name the private hierarchy for the invalidation below. */
+            invalidatePointer = Local->EptPointer;
+        }
+        /* Order the restoration before invalidating any translation. */
+        KeMemoryBarrier();
+        /* Discard translations built from the restricted leaf. */
+        if (KswordARKHvmAsmInveptSingle(
+                invalidatePointer != 0ULL
+                    ? invalidatePointer
+                    : Runtime->EptPointer) != 0U) {
+            /* Report that the resident dispatcher must devirtualize. */
+            return FALSE;
+        }
+        /* Record the hit scene on the owning processor only. */
+        if (WatchHit->FirstHit) {
+            /*
+             * Range match is an attribution refinement, never a filter: the
+             * hit is reported either way, because the hardware watched the
+             * whole page and saying otherwise would misdescribe what happened.
+             */
+            WatchHit->RangeMatch = KswordArkHvmWatchRangeMatch(
+                GuestLinearAddressValid ? 1 : 0,
+                GuestLinearAddress,
+                watchSlot->WatchRequestedAddress,
+                watchSlot->WatchRequestedLength) != 0;
+            /* Preserve the scene the dispatcher will publish as evidence. */
+            watchSlot->WatchLastHitGuestPhysicalAddress = GuestPhysicalAddress;
+            watchSlot->WatchLastHitGuestLinearAddress = GuestLinearAddress;
+            watchSlot->WatchLastHitGuestLinearValid =
+                GuestLinearAddressValid ? 1U : 0U;
+            watchSlot->WatchLastHitRangeMatch =
+                WatchHit->RangeMatch ? 1UL : 0UL;
+            watchSlot->WatchHitCount += 1UL;
+            /*
+             * Assume the evidence was lost until the ring says otherwise.
+             *
+             * The publish happens in the dispatcher, after this function
+             * returns, and it can fail.  Starting from "lost" means a failed
+             * publish needs no extra bookkeeping to be reported honestly,
+             * while starting from "published" would quietly claim evidence
+             * that does not exist.
+             */
+            watchSlot->WatchLastHitStatus =
+                KSWORD_ARK_HVM_EPT_WATCH_HIT_EVENT_LOST;
+            /* Order every recorded field before the terminal state. */
+            KeMemoryBarrier();
+            /* Publish the terminal lifecycle state for this armed round. */
+            InterlockedExchange(
+                &watchSlot->WatchState,
+                (LONG)KSWORD_ARK_HVM_EPT_WATCH_STATE_DISARMED);
+        }
+        /* Request the resume that re-executes the original instruction. */
+        *Disposition = KSW_HVM_EPT_DISPOSITION_WATCH_ONCE;
+        /* Report a completely resolved violation with residency intact. */
+        return TRUE;
+    }
+    /*
+     * A watch that reached here shares its page with another rule, which
+     * installation is supposed to make impossible.  Deny the one-instruction
+     * grant so the aggregate falls through to fail-closed devirtualization
+     * rather than resolving as whichever rule happened to be scanned first.
+     */
+    if (watchSlot != NULL) {
+        /* Prevent any temporary grant for an inconsistent rule set. */
+        allAllowOnce = FALSE;
     }
     /*
      * A durable denial outranks an overlapping allow-once grant: permitting

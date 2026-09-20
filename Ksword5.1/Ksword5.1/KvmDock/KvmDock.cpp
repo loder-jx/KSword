@@ -4,8 +4,8 @@
 #include "../KernelDock/KernelHvmTab.h"
 #include "../UI/FlowLayout.h"
 #include "../UI/KvmControl.h"
-#include "../UI/KvmCommandPanel.h"
 #include "../UI/KvmGuestVmPanel.h"
+#include "../UI/KvmWatchPanel.h"
 #include "../theme.h"
 
 #include <QGroupBox>
@@ -120,12 +120,6 @@ void KvmDock::setCommandOperationHandler(std::function<void(bool)> handler)
     m_commandOperationHandler = std::move(handler);
 }
 
-void KvmDock::showCommandPanel()
-{
-    m_tabs->setCurrentWidget(m_commandPanel);
-    m_commandPanel->setFocus();
-}
-
 void KvmDock::setOperationRunning(const bool running)
 {
     if (m_operationRunning == running)
@@ -133,12 +127,13 @@ void KvmDock::setOperationRunning(const bool running)
         return;
     }
     m_operationRunning = running;
-    m_commandPanel->setEnabled(!running);
     m_hvmTab->setEnabled(!running);
+    // 内存监视发的是同一条 EPT 规则 IOCTL，与其余入口共用驱动侧那把状态锁。
+    m_watchPanel->setEnabled(!running);
     // 「跑第三方虚拟机」页发的是同一批控制命令，必须和其它入口一起串行化：
     // 漏掉它，别处的命令在飞时用户仍能按下「一键完成全部五步」，两路 IOCTL
     // 会同时压到驱动侧那把状态锁上。自己发起时它先经 setBusy 禁掉自家按钮，
-    // 再被这一行连同整页禁用，与「完整操作」页同一条路径。
+    // 再被这一行连同整页禁用。
     m_guestVmPanel->setEnabled(!running);
     updateLifecycleView();
     if (!running)
@@ -233,23 +228,33 @@ void KvmDock::initializeUi()
     m_prepareButton = new QPushButton(
         ks::i18n::sourceText(QStringLiteral("准备资源（不进入常驻）")),
         prepareGroup);
-    m_prepareButton->setToolTip(ks::i18n::sourceText(QStringLiteral("分配每处理器资源并建立 EPT，但不进入常驻。分离视图、MSR 策略、CR 策略与执行域都必须在这一步之后、启动常驻之前安装 —— 常驻期间这几张表都是不可变的。")));
+    // 说明里同时点名两套后端：这一页在 AMD 机器上结构不变，只是有些入口会灰掉。
+    // 把 Intel 的术语写死在这里，等于让 AMD 用户看着一句与自己无关的话去按按钮。
+    m_prepareButton->setToolTip(ks::i18n::sourceText(QStringLiteral("按当前后端分配每处理器资源并建立 EPT 或 NPT，但不进入常驻。分离视图、MSR 策略、CR 策略与执行域都必须在这一步之后、启动常驻之前安装 —— 常驻期间这几张表都是不可变的。")));
     m_releaseButton = new QPushButton(
         ks::i18n::sourceText(QStringLiteral("释放资源")),
         prepareGroup);
     m_releaseButton->setToolTip(ks::i18n::sourceText(QStringLiteral("释放全部可逆资源，回到未准备状态。改过分离视图后端或每处理器私有 EPT 之后必须走这一步 —— 那两个选择只在准备资源时被消费，已准备的运行时改开关不会生效。")));
+    // 「硬件虚拟化证据」原先只有把页翻到最后一个子 Tab 才找得到。放进第 1 步，
+    // 是因为它回答的正是这一步之前必须先问的问题：这台机器到底是什么后端、
+    // 逐核准备到哪儿了。它只读，任何时候按都不改状态。
+    m_evidenceButton = new QPushButton(
+        ks::i18n::sourceText(QStringLiteral("硬件虚拟化证据")),
+        prepareGroup);
+    m_evidenceButton->setToolTip(ks::i18n::sourceText(QStringLiteral("切到证据页：完整能力、逐处理器状态与退出计数。只读，不改变任何状态。")));
     prepareRow->addWidget(m_prepareButton);
     prepareRow->addWidget(m_releaseButton);
+    prepareRow->addWidget(m_evidenceButton);
     controlLayout->addWidget(prepareGroup);
 
-    // 第 2 步：一个引导式入口加六个 R-1 面板。它们本身不改状态，改状态的是里面的安装动作，
+    // 第 2 步：一个引导式入口加七个 R-1 面板。它们本身不改状态，改状态的是里面的安装动作，
     // 而那些动作要求资源已准备且未常驻——正是这个分组标题写的那句话。
     auto* const installGroup = new QGroupBox(
         ks::i18n::sourceText(QStringLiteral("第 2 步 · 安装（要求资源已准备且未常驻）")),
         controlPanel);
     auto* const installRow = new ks::ui::FlowLayout(installGroup, 6, 6, 4);
     // 引导式入口放在第一个：它是这一组里唯一一个不要求用户先自己算出物理页地址的。
-    // 下面那六个面板保留原样给专家用——它们能做的事更多，代价是每一个值都要自己备好。
+    // 下面那七个面板保留原样给专家用——它们能做的事更多，代价是每一个值都要自己备好。
     m_hookWizardButton = new QPushButton(
         ks::i18n::sourceText(QStringLiteral("添加 Hook（引导式）...")),
         installGroup);
@@ -272,17 +277,17 @@ void KvmDock::initializeUi()
     m_eventButton = new QPushButton(
         ks::i18n::sourceText(QStringLiteral("事件流...")),
         installGroup);
+    m_processButton = new QPushButton(
+        ks::i18n::sourceText(QStringLiteral("R-1 进程处置与注入...")),
+        installGroup);
+    m_processButton->setToolTip(ks::i18n::sourceText(QStringLiteral("在 R0 之外冻结或结束一个进程，或用分离视图加线程劫持在目标里加载 DLL。要求先开启 CR3 追踪、用 EPTP 切换后端准备资源，且常驻停着。这不是安全边界：目标换掉自己那一页的物理页就不在被拒绝的页上了。")));
     for (QPushButton* const button :
-         { m_hookWizardButton, m_viewButton, m_domainButton, m_msrButton, m_crButton, m_memoryButton, m_eventButton })
+         { m_hookWizardButton, m_viewButton, m_domainButton, m_msrButton, m_crButton,
+           m_memoryButton, m_eventButton, m_processButton })
     {
         installRow->addWidget(button);
     }
     controlLayout->addWidget(installGroup);
-    auto* commandsButton = new QPushButton(ks::i18n::sourceText(QStringLiteral("KVM 完整命令面板")), controlPanel);
-    controlLayout->addWidget(commandsButton);
-    connect(commandsButton, &QPushButton::clicked, this, [this]() {
-        showCommandPanel();
-    });
 
     // 第 3 步：进出常驻，以及唯一一个"卡住时先做这个"的出口。
     auto* const residentGroup = new QGroupBox(
@@ -293,7 +298,7 @@ void KvmDock::initializeUi()
     m_soakButton = new QPushButton(
         ks::i18n::sourceText(QStringLiteral("常驻保持自检（5 秒）")),
         residentGroup);
-    m_soakButton->setToolTip(ks::i18n::sourceText(QStringLiteral("全部逻辑处理器会进入 VMX non-root 并保持数秒后自动退出。期间任何未被处理的 VM-exit 都会被记录为掉核，与 Hyper-V/VBS 冲突时可能导致系统不稳定。")));
+    m_soakButton->setToolTip(ks::i18n::sourceText(QStringLiteral("全部逻辑处理器会用当前后端进入来宾态并保持数秒后自动退出。期间任何未被处理的退出都会被记录为掉核，与已有 Hypervisor 冲突时可能导致系统不稳定。")));
     m_resetFaultButton = new QPushButton(
         ks::i18n::sourceText(QStringLiteral("重置故障状态")),
         residentGroup);
@@ -316,6 +321,7 @@ void KvmDock::initializeUi()
     for (QPushButton* const button :
          { m_prepareButton,
            m_releaseButton,
+           m_evidenceButton,
            m_hookWizardButton,
            m_viewButton,
            m_domainButton,
@@ -323,6 +329,7 @@ void KvmDock::initializeUi()
            m_crButton,
            m_memoryButton,
            m_eventButton,
+           m_processButton,
            m_residentButton,
            m_soakButton,
            m_resetFaultButton })
@@ -335,6 +342,11 @@ void KvmDock::initializeUi()
     });
     connect(m_releaseButton, &QPushButton::clicked, this, [this]() {
         requestAction(Action::ReleaseResources);
+    });
+    // 证据页不经 ActionHandler：它不是一条控制命令，只是把本页的子 Tab 翻过去。
+    // 走分派会让 MainWindow 多出一条什么都不做的分支。
+    connect(m_evidenceButton, &QPushButton::clicked, this, [this]() {
+        m_tabs->setCurrentWidget(m_hvmTab);
     });
     connect(m_hookWizardButton, &QPushButton::clicked, this, [this]() {
         requestAction(Action::OpenHookWizard);
@@ -356,6 +368,9 @@ void KvmDock::initializeUi()
     });
     connect(m_eventButton, &QPushButton::clicked, this, [this]() {
         requestAction(Action::OpenEventDialog);
+    });
+    connect(m_processButton, &QPushButton::clicked, this, [this]() {
+        requestAction(Action::OpenProcessDialog);
     });
     connect(m_residentButton, &QPushButton::clicked, this, [this]() {
         requestAction(Action::ToggleResident);
@@ -389,7 +404,7 @@ void KvmDock::initializeUi()
     detailLayout->addStretch(1);
     detailPage->setWidget(detailHost);
 
-    // 从「内核」页整块搬过来的 VT-x/EPT 页。它带着 PREPARE / SELF_TEST /
+    // 从「内核」页整块搬过来的硬件虚拟化页。它带着 PREPARE / SELF_TEST /
     // 一次性来宾 / TEARDOWN 与 EPT 规则——EPT 规则至今只有这一条路可达，
     // 所以它必须跟着搬，而不是被上面的按钮取代。
     //
@@ -412,14 +427,27 @@ void KvmDock::initializeUi()
                  ks::i18n::sourceText(QStringLiteral("跑第三方虚拟机")));
 
     tabs->addTab(controlPanel, ks::i18n::sourceText(QStringLiteral("控制")));
-    m_commandPanel = new KvmCommandPanel(tabs);
-    m_commandPanel->onBusyChanged = [this](bool running) {
+
+    // 内存监视排在控制之后、状态详情之前。
+    //
+    // 它是这一页里唯一一个**产出证据**而不是改状态的功能：其余几页回答的是
+    // "现在装了什么、走到哪一步了"，这一页回答的是"下一次是谁动了它"。紧挨着
+    // 控制页，是因为它有一个硬前置条件——常驻必须在跑，否则装上的监视永远不会
+    // 响，而那个条件正是控制页在管的。
+    m_watchPanel = new KvmWatchPanel(tabs);
+    m_watchPanel->onBusyChanged = [this](bool running) {
         setOperationRunning(running);
         if (m_commandOperationHandler) { m_commandOperationHandler(running); }
     };
-    tabs->addTab(m_commandPanel, ks::i18n::sourceText(QStringLiteral("完整操作")));
+    tabs->addTab(m_watchPanel, ks::i18n::sourceText(QStringLiteral("内存监视")));
+
     tabs->addTab(detailPage, ks::i18n::sourceText(QStringLiteral("状态详情")));
-    tabs->addTab(m_hvmTab, ks::i18n::sourceText(QStringLiteral("VT-x/EPT 证据")));
+    // 页名不再写 VT-x/EPT：同一页在 AMD 机器上显示 SVM/NPT 的读数，
+    // 页名钉死在一套架构上会让另一套的用户以为这页与自己无关。
+    tabs->addTab(m_hvmTab, ks::i18n::sourceText(QStringLiteral("硬件虚拟化证据")));
+    // 默认落在「控制」而不是第一页：「跑第三方虚拟机」是给撞上问题的人准备的
+    // 出口，不是这一页的主线。主线是三步生命周期，它在「控制」上。
+    tabs->setCurrentWidget(controlPanel);
     rootLayout->addWidget(tabs, 1);
 
     m_pollTimer = new QTimer(this);
@@ -466,10 +494,14 @@ void KvmDock::applyState(const ksword::kvm::KvmState& state)
     m_hardwareAvailable =
         state.availability == ksword::kvm::KvmAvailability::Available ||
         state.availability == ksword::kvm::KvmAvailability::NotPrepared;
-    // NotPrepared 是"硬件门过了但资源还没分配"，也就是第 1 步尚未完成。
-    // 其余可用态都意味着 PREPARE 已经做过。
-    m_resourcesReady =
-        state.availability == ksword::kvm::KvmAvailability::Available;
+    // 资源是否已准备直接读驱动回报的那一位，不再从 availability 反推。
+    //
+    // 反推在 AMD 上会给出相反的答案：availability 报的是"能不能常驻"，而
+    // AMD 后端在准备完成之后照样可能因为别的条件不落在 Available 上——那时
+    // 第 2 步的窗口期明明开着，步骤条却还停在第 1 步。resourcesReady 是驱动
+    // 对 PREPARE 已执行且未 TEARDOWN 的直接回报，没有这层歧义。
+    m_resourcesReady = state.resourcesReady;
+    m_amdBackend = state.backend == KSWORD_ARK_HVM_BACKEND_SVM;
     m_residentActive = state.residentActive;
     m_faulted = state.faulted;
     m_availabilityText = ksword::kvm::describeAvailability(state.availability);
@@ -524,6 +556,12 @@ void KvmDock::updateLifecycleView()
     {
         stateText = ks::i18n::sourceText(QStringLiteral("当前：第 3 步。常驻运行中；分离视图、MSR 策略、CR 策略与执行域这几张表在常驻期间不可改，要改先停止常驻。"));
     }
+    else if (m_resourcesReady && m_amdBackend)
+    {
+        // AMD 下第 2 步是空的：安装类入口全都还没有 SVM 实现。照搬 Intel 的
+        // 那句话会让用户去找一个按不下去的窗口期，所以这一态单独说清楚。
+        stateText = ks::i18n::sourceText(QStringLiteral("当前：第 2 步。资源已按 AMD SVM/NPT 准备好且未常驻。第 2 步的安装类入口尚无 SVM 实现，AMD 上可以直接进入第 3 步启动常驻。"));
+    }
     else if (m_resourcesReady)
     {
         stateText = ks::i18n::sourceText(QStringLiteral("当前：第 2 步。资源已准备且未常驻，这是安装分离视图、MSR 策略、CR 策略与执行域的唯一窗口期。"));
@@ -559,18 +597,54 @@ void KvmDock::updateLifecycleView()
     };
     const QString resourceGateReason = resourceStageReason();
     m_prepareButton->setEnabled(resourceGateReason.isEmpty());
-    m_releaseButton->setEnabled(resourceGateReason.isEmpty());
     setGatedTooltip(m_prepareButton, resourceGateReason);
-    setGatedTooltip(m_releaseButton, resourceGateReason);
+    // 释放资源不看硬件门：硬件门回答的是"能不能常驻"，而释放要做的事正好相反
+    // ——把已经分配出去的东西收回来。用准备那条门一起判，会让"硬件条件变了、
+    // 资源却还挂着"这种状态没有任何出口，只能重启机器。
+    const QString releaseReason = m_operationRunning ? busyGate
+        : !m_driverRunning ? driverGate
+        : m_residentActive ? residentGate
+        : QString();
+    m_releaseButton->setEnabled(releaseReason.isEmpty());
+    setGatedTooltip(m_releaseButton, releaseReason);
+    // 证据页只读，驱动在就能看。
+    const QString evidenceReason = m_operationRunning ? busyGate
+        : !m_driverRunning ? driverGate
+        : QString();
+    m_evidenceButton->setEnabled(evidenceReason.isEmpty());
+    setGatedTooltip(m_evidenceButton, evidenceReason);
 
-    // 这七个入口只要驱动在就能打开：里面读得到状态，写得动的动作各自有门。
+    // 这八个入口只要驱动在就能打开：里面读得到状态，写得动的动作各自有门。
     // 常驻期间照样能开，否则用户连"现在装了什么"都看不到。
     const QString panelGateReason = m_driverRunning ? QString() : driverGate;
     for (QPushButton* const button :
-         { m_hookWizardButton, m_viewButton, m_domainButton, m_msrButton, m_crButton, m_memoryButton, m_eventButton })
+         { m_hookWizardButton, m_viewButton, m_domainButton, m_msrButton, m_crButton,
+           m_memoryButton, m_eventButton, m_processButton })
     {
         button->setEnabled(m_driverRunning);
         setGatedTooltip(button, panelGateReason);
+    }
+
+    // AMD 后端：结构不变，把没有对应实现的入口灰掉并说明原因。
+    //
+    // 灰掉的这一组共同点不是"AMD 做不到"，而是它们全都建立在 EPT 分离视图这
+    // 一套机制上（隐蔽 Hook、视图、执行域、R-1 进程处置与注入都要切 EPTP），
+    // 而 SVM/NPT 后端目前只做到资源准备、逐核 VMRUN 自检与常驻。MSR 与 CR
+    // 策略同理，它们消费的是 VMCS 字段而不是 VMCB 的对应位。
+    //
+    // 留着按钮而不是把它们藏起来，是因为"这台机器上没有这个功能"和"这个版本
+    // 还没做"要分得开：藏起来的入口无法表达后者，用户只会以为自己找错了地方。
+    // 内存操作与事件流不在其中：它们走的是物理内存窗口与事件环，与后端无关。
+    if (m_amdBackend)
+    {
+        const QString amdGate = ks::i18n::sourceText(QStringLiteral("灰掉的原因：这一项建立在 EPT 分离视图或 VMCS 字段上，当前的 AMD SVM/NPT 后端还没有对应实现。AMD 上可用的是资源准备、逐核自检与常驻。"));
+        for (QPushButton* const button :
+             { m_hookWizardButton, m_viewButton, m_domainButton, m_msrButton,
+               m_crButton, m_processButton })
+        {
+            button->setEnabled(false);
+            setGatedTooltip(button, amdGate);
+        }
     }
 
     const auto residentToggleReason = [&]() -> QString {

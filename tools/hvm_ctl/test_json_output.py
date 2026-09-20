@@ -1,9 +1,11 @@
 """Use the production query formatter and Windows PowerShell 5.1 pipe decoder."""
 import json
 import pathlib
+import re
 import subprocess
 
-root = pathlib.Path(__file__).resolve().parents[2]
+HERE = pathlib.Path(__file__).resolve().parent
+root = HERE.parents[1]
 fixture = root / 'tools/hvm_ctl/test_query_json.exe'
 cli = root / 'tools/hvm_ctl/hvm_ctl.exe'
 raw = subprocess.check_output([str(fixture)])
@@ -25,7 +27,16 @@ assert json.loads(strings[1]) == '\ufffd\ufffd'
 assert all(line.isascii() for line in strings)
 commands = subprocess.check_output([str(cli), '--json', 'commands'])
 assert commands.isascii()
-assert len(json.loads(commands)['commands']) == 62
+# 期望条数从目录源码现算，不写死。
+#
+# 写死的 62 在远端加进 AMD 探针命令时没人同步，这个测试从那以后一直是红的，
+# 而红得毫无信息量——它想守的是「JSON 输出与目录一致」，不是「目录恰好 62 条」。
+EXPECTED_COMMANDS = len(re.findall(
+    r'^\s*\{\s*"(?:\\.|[^"\\])*",\s*"(?:\\.|[^"\\])*",',
+    (HERE / 'HvmCommandCatalog.c').read_text(encoding='utf-8-sig')
+    .split('g_commands[] = {', 1)[1].split('\n};', 1)[0], re.M))
+assert EXPECTED_COMMANDS > 0
+assert len(json.loads(commands)['commands']) == EXPECTED_COMMANDS
 metrics = json.loads(subprocess.check_output([str(fixture), 'metrics']))
 assert metrics['version'] == 4 and metrics['backend'] == 2
 assert metrics['svmProcessors'][0]['nestedProbe'] == {
@@ -41,9 +52,10 @@ $ErrorActionPreference='Stop'
 $value = & '%s' | ConvertFrom-Json
 if ($value.backend -ne 2 -or $value.nestedLastRefusalSiteText.Length -ne 5) { throw 'Status mismatch' }
 $catalog = & '%s' --json commands | ConvertFrom-Json
-if ($catalog.commands.Count -ne 62) { throw 'Catalog mismatch' }
+if ($catalog.commands.Count -ne %d) { throw 'Catalog mismatch' }
 'POWERSHELL_CP936_JSON=PASS'
-""" % (str(fixture).replace("'", "''"), str(cli).replace("'", "''"))
+""" % (str(fixture).replace("'", "''"), str(cli).replace("'", "''"),
+       EXPECTED_COMMANDS)
 result = subprocess.run(['powershell.exe', '-NoProfile', '-Command', script], capture_output=True)
 assert result.returncode == 0, result.stderr
 print(result.stdout.decode('ascii').strip())

@@ -30,6 +30,27 @@ ALLOWED_OPERAND = re.compile(
 # 私有根首次使用前的失效是另一处合法用法，操作数是 EptLocal 自己的指针。
 ALLOWED_PRIVATE_ROOT = re.compile(r"Context->EptLocal->EptPointer", re.S)
 
+# 首次访问监视的修复路径。
+#
+# 与 ALLOWED_OPERAND 同构，但三元表达式的第一项存在一个局部变量里，而不是
+# Transient->EptPointer —— 因为这条路径**不建 transient 记录**：监视命中后权限是
+# 永久恢复的，没有"待收回"的东西。照搬那个形态会让它在私有层次上恒定失效共享根，
+# 也就是恰好退化成这道门禁要防的那件事。
+#
+# 与那一条一样紧：三元的两项都必须是同一个局部变量与共享根，写错任意一处都不匹配。
+ALLOWED_WATCH_RESTORE = re.compile(
+    r"invalidatePointer\s*!=\s*0ULL\s*\?\s*"
+    r"invalidatePointer\s*:\s*Runtime->EptPointer",
+    re.S,
+)
+
+# 那个局部变量只能来自私有层次的指针。少了这一条，上面的白名单就只是在认一个
+# 名字，而那个名字可以被赋成任何东西。
+REQUIRED_WATCH_RESTORE_SOURCE = re.compile(
+    r"invalidatePointer\s*=\s*Local->EptPointer\s*;",
+    re.S,
+)
+
 # 常驻入口失效的是"这次进入真正要装载的那个层次"，形态和翻转路径不同：
 # 一处是即将写进 VMCS 的 EPTP，一处是这次常驻可能切过去的每个次级层次。
 # 拿翻转路径的形态去卡入口路径会把这两处正确的失效判成违规——而它们恰恰是
@@ -50,7 +71,7 @@ CHECKED_FUNCTIONS = [
     ("hvm_ept.c", "KswordARKHvmEptRestoreTransient",
      [ALLOWED_OPERAND, ALLOWED_PRIVATE_ROOT]),
     ("hvm_ept.c", "KswordARKHvmEptHandleViolation",
-     [ALLOWED_OPERAND, ALLOWED_PRIVATE_ROOT]),
+     [ALLOWED_OPERAND, ALLOWED_PRIVATE_ROOT, ALLOWED_WATCH_RESTORE]),
     ("hvm_ept_view.c", "KswordARKHvmEptViewHandleViolation",
      [ALLOWED_OPERAND, ALLOWED_PRIVATE_ROOT]),
     ("hvm_resident.c", "KswordARKHvmConfigureResidentVmcsFromAsm",
@@ -107,6 +128,15 @@ def check_invept_operands():
                     "{}:{} {} 里的 INVEPT 操作数不在白名单内：{}".format(
                         name, line, symbol, " ".join(operand.split())
                     )
+                )
+            # 用了 invalidatePointer 这个形态，就必须同时证明它来自私有层次。
+            # 否则白名单只是在认一个名字，而名字可以被赋成任何东西。
+            if ALLOWED_WATCH_RESTORE.search(body) and not (
+                REQUIRED_WATCH_RESTORE_SOURCE.search(body)
+            ):
+                failures.append(
+                    "{}: {} 用了 invalidatePointer 作 INVEPT 操作数，"
+                    "但它没有被赋成 Local->EptPointer".format(name, symbol)
                 )
     return failures
 

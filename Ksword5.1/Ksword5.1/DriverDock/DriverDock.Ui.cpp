@@ -2,6 +2,11 @@
 #include "../KernelDock/KernelThreadAuditTab.h"
 #include "../UI/VisibleTableWidget.h"
 #include "../UI/DetailLayoutRegistry.h"
+/* 统一入口：这一页不需要知道 GPA、EPT 叶或 ruleId。 */
+#include "../UI/KvmWatchDialog.h"
+
+#include <QAction>
+#include <QMenu>
 
 // 说明：由原聚合式实现迁移为独立 .cpp，成员函数实现保持原样。
 using namespace ksword::driver_dock_internal;
@@ -876,6 +881,99 @@ void DriverDock::initializeObjectInfoTab()
     m_majorFunctionTable->setHorizontalHeaderLabels(driverMajorFunctionTableHeaders());
     configureReadOnlyTable(m_majorFunctionTable);
     m_majorFunctionTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
+    /*
+     * 右键装一条 R-1 内存监视。
+     *
+     * 这一页能回答"这条 dispatch 现在指向哪儿"，但答不出"是谁把它改成这样的"
+     * —— 那个动作已经过去了。监视回答的是下一次：装上之后继续正常用系统，
+     * 等有人再动它时记下 RIP、模块与地址空间。
+     *
+     * 两项分别对应两个不同的问题，不要合并：
+     * - 写入 DriverObject 所在页 = 谁在装 hook（MajorFunction 槽位与
+     *   DriverObject 落在同一页上，EPT 页粒度下这本来就是同一件事）；
+     * - 执行这条 dispatch = 谁在用它。
+     */
+    m_majorFunctionTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(
+        m_majorFunctionTable,
+        &QTableWidget::customContextMenuRequested,
+        m_majorFunctionTable,
+        [this](const QPoint& localPosition) {
+            QTableWidget* const table = m_majorFunctionTable;
+            if (table == nullptr)
+            {
+                return;
+            }
+            const QModelIndex clicked = table->indexAt(localPosition);
+            if (clicked.isValid())
+            {
+                table->setCurrentCell(clicked.row(), clicked.column());
+            }
+            const int row = table->currentRow();
+            const quint64 objectAddress =
+                table->property("ks_driver_object_address").toULongLong();
+            const QString driverName =
+                table->property("ks_driver_object_name").toString();
+            const quint64 dispatchAddress =
+                (row >= 0 && table->item(row, 0) != nullptr)
+                    ? table->item(row, 0)->data(Qt::UserRole).toULongLong()
+                    : 0ULL;
+            const QString majorName =
+                (row >= 0 && table->item(row, 0) != nullptr)
+                    ? table->item(row, 0)->text()
+                    : QString();
+
+            QMenu menu(table);
+            menu.setStyleSheet(KswordTheme::ContextMenuStyle());
+            QAction* const watchObject = menu.addAction(driverText(
+                "driver.object.major_function.menu.hvm_watch_object",
+                QStringLiteral("HVM 监视：下一次写入这个 DriverObject（含 MajorFunction 表）")));
+            watchObject->setEnabled(objectAddress != 0ULL);
+            QAction* const watchDispatch = menu.addAction(driverText(
+                "driver.object.major_function.menu.hvm_watch_dispatch",
+                QStringLiteral("HVM 监视：下一次执行这条 dispatch 例程")));
+            watchDispatch->setEnabled(dispatchAddress != 0ULL);
+
+            QAction* const chosen =
+                menu.exec(table->viewport()->mapToGlobal(localPosition));
+            if (chosen == watchObject && objectAddress != 0ULL)
+            {
+                ks::ui::HvmWatchRequest request;
+                request.virtualAddress = true;
+                request.address = objectAddress;
+                /*
+                 * 请求范围留 0（整页）而不是编一个 DRIVER_OBJECT 的大小：
+                 * 那个结构的布局是版本相关的，写死一个偏移只会在某个版本上
+                 * 悄悄把范围判据算错，而范围判据错了的表现是一句读起来正确
+                 * 的错误结论。
+                 */
+                request.length = 0ULL;
+                request.access = KSWORD_ARK_HVM_EPT_ACCESS_WRITE;
+                request.label = driverText(
+                    "driver.object.major_function.menu.hvm_watch_object.label",
+                    QStringLiteral("DriverObject %1"))
+                    .arg(driverName.isEmpty()
+                        ? QStringLiteral("0x%1").arg(objectAddress, 0, 16)
+                        : driverName);
+                ks::ui::openHvmWatch(this, request);
+            }
+            else if (chosen == watchDispatch && dispatchAddress != 0ULL)
+            {
+                ks::ui::HvmWatchRequest request;
+                request.virtualAddress = true;
+                request.address = dispatchAddress;
+                request.length = 1ULL;
+                request.access = KSWORD_ARK_HVM_EPT_ACCESS_EXECUTE;
+                request.label = driverText(
+                    "driver.object.major_function.menu.hvm_watch_dispatch.label",
+                    QStringLiteral("%1 的 %2 dispatch 例程"))
+                    .arg(driverName.isEmpty()
+                        ? QStringLiteral("DriverObject")
+                        : driverName)
+                    .arg(majorName);
+                ks::ui::openHvmWatch(this, request);
+            }
+        });
     majorLayout->addWidget(m_majorFunctionTable, 1);
     m_objectDetailTabWidget->addTab(m_majorFunctionPage, QIcon(":/Icon/process_threads.svg"), QStringLiteral("MajorFunction"));
 

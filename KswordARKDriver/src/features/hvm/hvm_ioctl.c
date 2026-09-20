@@ -457,9 +457,18 @@ KswordARKHvmIoctlEptRule(
     /* Bind the fixed protocol output view. */
     ruleResponse =
         (KSWORD_ARK_HVM_EPT_RULE_RESPONSE*)outputBuffer;
-    /* Apply central high-risk policy to every mutating EPT rule operation. */
+    /*
+     * Apply central high-risk policy to every mutating EPT rule operation.
+     *
+     * Both query forms are exempt: they read rule records and publish nothing.
+     * Auditing a read as KERNEL_PATCH would record a mutation that never
+     * happened, and a stricter policy configuration would then deny the one
+     * operation a user needs most - reading back what a watch caught.
+     */
     if (ruleRequest->operation !=
-        KSWORD_ARK_HVM_EPT_RULE_QUERY) {
+            KSWORD_ARK_HVM_EPT_RULE_QUERY &&
+        ruleRequest->operation !=
+            KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY) {
         KSWORD_ARK_SAFETY_CONTEXT safetyContext = { 0 };
 
         /* Bind policy auditing to the kernel-patch operation class. */
@@ -1443,9 +1452,17 @@ KswordARKHvmIoctlProcess(
     /* 绑定定长协议输出视图。 */
     processResponse =
         (KSWORD_ARK_HVM_PROCESS_RESPONSE*)outputBuffer;
-    /* 每一个会改变状态的操作都过一遍中央高风险策略。 */
+    /*
+     * 每一个会改变状态的操作都过一遍中央高风险策略。
+     *
+     * 两个只读操作走在外面。QUERY 与 RESOLVE_CR3 都不改变任何状态，而这段策略
+     * 把"不是 FREEZE"一律归成结束进程——漏掉一个只读操作，代价不是多一次确认，
+     * 是一次查表被记进证据里当成了一次结束进程。
+     */
     if (requestSnapshot.operation !=
-            KSWORD_ARK_HVM_PROCESS_OP_QUERY) {
+            KSWORD_ARK_HVM_PROCESS_OP_QUERY &&
+        requestSnapshot.operation !=
+            KSWORD_ARK_HVM_PROCESS_OP_RESOLVE_CR3) {
         KSWORD_ARK_SAFETY_CONTEXT safetyContext = { 0 };
 
         /*

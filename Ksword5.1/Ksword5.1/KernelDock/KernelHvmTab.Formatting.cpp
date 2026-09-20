@@ -32,7 +32,7 @@ QString KernelHvmTab::buildDetail(
             "CR0 fixed0/fixed1：0x%9 / 0x%10\n"
             "CR4 fixed0/fixed1：0x%11 / 0x%12\n"
             "EPTP：0x%13\n"
-            "EPT PML4/PDPT/2MiB leaf：%14 / %15 / %16\n"
+            "EPT PML4 项 / PDPT 项 / 2MiB 叶：%14 / %15 / %16\n"
             "映射 RAM：%17 bytes\n"
             "最高映射物理地址：0x%18\n"
             "最近 NTSTATUS：%19\n"
@@ -46,9 +46,7 @@ QString KernelHvmTab::buildDetail(
             "最近启动使用嵌套 VMX：%28\n\n"
             "边界：一次性来宾仍会在 VMCALL 后 VMCLEAR/VMXOFF。驻留 VMM 仅在 GenuineIntel、完整 VT-x/EPT/INVEPT、无现有 Hypervisor、全 CPU 自检以及电源/处理器拓扑/驱动卸载保护全部通过后开放；离开 S0 前会同步全核 VMXOFF，驻留期间 DriverUnload 被临时移除。AMD 与其它非 Intel CPU 会在驱动端拒绝；"
             "未知退出、EPT misconfiguration 和未实现强制退出会 fail-closed 去虚拟化。"
-            "EPT 恒等映射覆盖 [0, min(CPUID MAXPHYADDR, 8 TiB))，"
-            "RAM 叶按 MTRR 定型，固件、PCI/ReBAR 与其它物理空洞保守使用 UC；"
-            "MAXPHYADDR 超出 8 TiB 时会标记 EPT 截断并禁止驻留。"
+            "EPT 恒等映射覆盖 [0, min(CPUID MAXPHYADDR, 本驱动窗口))；实际覆盖到哪里看上面的「最高映射物理地址」，窗口随驱动版本变，这里不写死数字。含已装 RAM 的 1 GiB 窗口按 MTRR 定型并保持 2 MiB 粒度（规则、视图与内存监视都从 2 MiB 叶往下拆）；不含 RAM 的窗口是固件/PCI/ReBAR 一类，统一 UC 并用单个 1 GiB 叶发布——所以「2MiB 叶」这个数不覆盖整个窗口，别拿它乘 2 MiB 对账。MAXPHYADDR 超出窗口时标记 EPT 截断并禁止驻留，报的是「映射窗口不够」而不是「处理器不支持」。"
             "严格 EPT 规则只是取证 tripwire：命中后记录并去虚拟化，不注入异常，"
             "原访问可能从同一 RIP 在原生模式重试并成功。"))
         .arg(response.version)
@@ -321,6 +319,35 @@ QString KernelHvmTab::nestedStateText(const std::uint32_t state)
             "kernel.hvm.nested.state.unknown",
             QStringLiteral("未知"));
     }
+}
+
+QString KernelHvmTab::executionStageText(const std::uint32_t stage)
+{
+    switch (stage)
+    {
+    case KSWORD_ARK_HVM_STAGE_NONE:
+        return kernelText("kernel.hvm.stage.none", QStringLiteral("未执行"));
+    case KSWORD_ARK_HVM_STAGE_PREPARED:
+        return kernelText("kernel.hvm.stage.prepared", QStringLiteral("已准备"));
+    case KSWORD_ARK_HVM_STAGE_TESTED:
+        return kernelText("kernel.hvm.stage.tested", QStringLiteral("自检完成"));
+    case KSWORD_ARK_HVM_STAGE_ENTERING:
+        return kernelText("kernel.hvm.stage.entering", QStringLiteral("正在进入"));
+    case KSWORD_ARK_HVM_STAGE_ENTERED:
+        return kernelText("kernel.hvm.stage.entered", QStringLiteral("已进入来宾"));
+    case KSWORD_ARK_HVM_STAGE_EXIT:
+        return kernelText("kernel.hvm.stage.exit", QStringLiteral("已从来宾退出"));
+    case KSWORD_ARK_HVM_STAGE_STOPPED:
+        return kernelText("kernel.hvm.stage.stopped", QStringLiteral("已停止"));
+    case KSWORD_ARK_HVM_STAGE_FAILED:
+        return kernelText("kernel.hvm.stage.failed", QStringLiteral("失败"));
+    default:
+        break;
+    }
+    // 不把未知序号折成"未知"：新驱动加了阶段而界面还没跟上时，那个数字是
+    // 唯一能把现象对回驱动改动的线索，折掉它等于把排查起点删了。
+    return kernelText("kernel.hvm.stage.unknown", QStringLiteral("未知阶段（%1）"))
+        .arg(stage);
 }
 
 QString KernelHvmTab::ntStatusText(const long status)

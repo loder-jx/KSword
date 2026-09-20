@@ -247,6 +247,13 @@ jobs:
       - name: Validate kernel knowledge research chain
         run: python tools/validate_kernel_knowledge.py
 
+      # 这道门禁原先挂在主程序 vcxproj 的 BeforeTargets="ClCompile" 上，靠"每次
+      # 编译 GUI 都会顺带跑一遍"来生效。2026-09-19 主程序对 hvm_ctl 的依赖整条
+      # 摘掉，那个目标也一起删了——于是它变成一个谁都不跑的脚本。接到这里来：
+      # 纯源码解析，不需要先把探针编出来。
+      - name: Gate hvm_ctl command catalog
+        run: python tools/hvm_ctl/audit_catalog.py
+
       # 这两条不变量少一个字就会静默退化成共享层次：翻转路径的 INVEPT 操作数，
       # 以及两个 arm 站点的 Local 参数。改动落在 VM-exit 路径上，没有运行期
       # 验证手段，所以只能在编译机上钉死。门禁本身用两次变异注入验证过能抓到回归。

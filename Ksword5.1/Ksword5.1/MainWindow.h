@@ -99,7 +99,6 @@ public:
     ~MainWindow();
 
 public slots:
-    void focusKvmCommands();
     // focusHandleDockByPid 作用：
     // - 将“句柄”Dock 置顶并切换 PID 过滤；
     // - 供进程详情窗口发起“跳转到句柄视图”时调用。
@@ -760,6 +759,10 @@ private:
     bool m_kvmQueryInFlight = false;            // m_kvmQueryInFlight：合并并发的后台状态查询，避免请求堆积。
     bool m_kvmOperationRunning = false;         // m_kvmOperationRunning：常驻切换或保持自检期间禁用按钮。
     unsigned long m_kvmGeneration = 0;          // m_kvmGeneration：用于 compare-before 控制请求的状态代次。
+    // m_kvmBackend：驱动当前选定的虚拟化后端，取 KSWORD_ARK_HVM_BACKEND_*。
+    // 右键菜单靠它灰掉没有 AMD 实现的入口，与 KvmDock 上那组门用同一个判据——
+    // 两边各判各的，用户会在一个入口里按不动、在另一个入口里按了没反应。
+    unsigned long m_kvmBackend = 0;
     QString m_kvmTooltip;                       // m_kvmTooltip：最近一次快照生成的多行状态说明。
     bool m_r0DriverServiceRunning = false;      // m_r0DriverServiceRunning：KswordARK 驱动服务当前是否运行。
     bool m_r0UnavailablePromptArmed = false;   // 主窗口显示后才允许 R0 缺失提示，避免启动后台探测造成无意义弹窗。

@@ -1,4 +1,3 @@
-#include "ArkDriverClient/HvmCommandProcess.h"
 #include "MainWindow.h"
 
 #include <QtCore/QByteArray>
@@ -1304,8 +1303,6 @@ namespace
 
 int main(int argc, char* argv[])
 {
-    int hvmExitCode = 0;
-    if (ksword::ark::tryRunHvmCommandLine(&hvmExitCode)) { return hvmExitCode; }
     // 启动流程：
     // 1) 初始化 DPI 感知；
     // 2) 读取配置并处理推荐缩放；

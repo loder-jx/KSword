@@ -3680,11 +3680,30 @@ void DriverDock::rebuildDriverObjectEvidenceViews()
         const QSignalBlocker blocker(m_majorFunctionTable);
         m_majorFunctionTable->setSortingEnabled(false);
         m_majorFunctionTable->setRowCount(0);
+        /*
+         * DriverObject 自身的地址挂在表上，供右键的 HVM 监视用。
+         *
+         * 存在表上而不是每行一份：它对整张表是同一个值，而 MajorFunction
+         * 槽位与 DriverObject 落在同一个 4 KiB 页上 —— EPT 是页粒度，所以
+         * "监视某一项槽位"与"监视这个 DriverObject"在硬件上本来就是一回事，
+         * 界面要照实说，不要假装能精确到一项。
+         */
+        m_majorFunctionTable->setProperty(
+            "ks_driver_object_address",
+            static_cast<qulonglong>(result.driverObjectAddress));
+        m_majorFunctionTable->setProperty(
+            "ks_driver_object_name",
+            QString::fromStdWString(result.driverName));
         for (const ksword::ark::DriverMajorFunctionEntry& majorEntry : result.majorFunctions)
         {
             const int rowIndex = m_majorFunctionTable->rowCount();
             m_majorFunctionTable->insertRow(rowIndex);
-            m_majorFunctionTable->setItem(rowIndex, 0, createReadOnlyItem(driverMajorFunctionName(majorEntry.majorFunction)));
+            QTableWidgetItem* const majorItem =
+                createReadOnlyItem(driverMajorFunctionName(majorEntry.majorFunction));
+            /* dispatch 入口地址随行走：监视"谁执行了它"要用它，不是槽位地址。 */
+            majorItem->setData(Qt::UserRole,
+                static_cast<qulonglong>(majorEntry.dispatchAddress));
+            m_majorFunctionTable->setItem(rowIndex, 0, majorItem);
             m_majorFunctionTable->setItem(rowIndex, 1, createReadOnlyItem(formatCompactAddress(majorEntry.dispatchAddress)));
             m_majorFunctionTable->setItem(rowIndex, 2, createReadOnlyItem(QString::fromStdWString(majorEntry.moduleName).isEmpty()
                 ? QStringLiteral("-")

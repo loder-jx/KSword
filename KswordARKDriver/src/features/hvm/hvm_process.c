@@ -19,6 +19,8 @@ Environment:
 #include "hvm_ept_switch.h"
 #include "hvm_memory.h"
 
+#include "../../platform/pool_compat.h"
+
 #if defined(_M_AMD64)
 
 /* 层次物理页帧掩码。CR3 低位带 PCID 与标志，比较前必须掩掉。 */
@@ -34,6 +36,211 @@ Environment:
  */
 #define KSW_HVM_PROCESS_PID_IDLE 0UL
 #define KSW_HVM_PROCESS_PID_SYSTEM 4UL
+
+/* CR3 归因用的池标签与快照上限。 */
+#define KSW_HVM_PROCESS_RESOLVE_POOL_TAG 'RvHK'
+/* SystemProcessInformation 的类别号。 */
+#define KSW_HVM_PROCESS_INFORMATION_CLASS 5UL
+/*
+ * 快照上限 16 MiB。
+ *
+ * 一台跑着几百个进程的机器上这份快照是几百 KiB；给到 16 MiB 是为了不在进程数
+ * 异常多的机器上无声地失败，同时仍然有个上限——归因是个可有可无的便利功能，
+ * 它没有资格为了跑完而向内核要任意多的非分页内存。
+ */
+#define KSW_HVM_PROCESS_RESOLVE_SNAPSHOT_LIMIT (16UL * 1024UL * 1024UL)
+
+NTSYSAPI
+NTSTATUS
+NTAPI
+ZwQuerySystemInformation(
+    _In_ ULONG SystemInformationClass,
+    _Out_writes_bytes_opt_(SystemInformationLength) PVOID SystemInformation,
+    _In_ ULONG SystemInformationLength,
+    _Out_opt_ PULONG ReturnLength
+    );
+
+/*
+ * SystemProcessInformation 的前缀。
+ *
+ * 只声明到 UniqueProcessId 为止：后面的字段这里一个都不读，而多声明一个字段
+ * 就多一处会随 Windows 版本漂移的偏移。遍历只需要两个东西——下一条在哪、
+ * 这一条是谁。
+ */
+typedef struct _KSW_HVM_PROCESS_INFORMATION_PREFIX
+{
+    ULONG NextEntryOffset;
+    ULONG NumberOfThreads;
+    UCHAR Reserved1[48];
+    UNICODE_STRING ImageName;
+    KPRIORITY BasePriority;
+    HANDLE UniqueProcessId;
+} KSW_HVM_PROCESS_INFORMATION_PREFIX;
+
+/*
+ * 取一份进程快照，带一个有界的重试。
+ *
+ * 两次查询之间进程数会变，所以第一次问到的长度可能已经不够；重试四次并且每次
+ * 多留一点余量。重试用尽就如实失败，而不是拿一份可能被截断的快照继续走——
+ * 截断的后果是"扫过了没找到"，与"这个地址空间已经不在了"给出同一个答案。
+ */
+static NTSTATUS
+KswordARKHvmProcessCaptureSnapshot(
+    _Outptr_result_maybenull_ PVOID* SnapshotOut,
+    _Out_ ULONG* SnapshotBytesOut
+    )
+{
+    ULONG requiredBytes = 0UL;
+    ULONG attempt = 0UL;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+
+    /* 拒绝不完整的调用契约。 */
+    if (SnapshotOut == NULL || SnapshotBytesOut == NULL) {
+        /* 返回明确的契约失败。 */
+        return STATUS_INVALID_PARAMETER;
+    }
+    *SnapshotOut = NULL;
+    *SnapshotBytesOut = 0UL;
+    /* ZwQuerySystemInformation 只能在 PASSIVE_LEVEL 调用。 */
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL) {
+        /* 返回明确的运行级别失败。 */
+        return STATUS_INVALID_DEVICE_STATE;
+    }
+    (void)ZwQuerySystemInformation(
+        KSW_HVM_PROCESS_INFORMATION_CLASS,
+        NULL,
+        0UL,
+        &requiredBytes);
+    /* 至少要装得下一条记录。 */
+    if (requiredBytes < sizeof(KSW_HVM_PROCESS_INFORMATION_PREFIX)) {
+        requiredBytes = sizeof(KSW_HVM_PROCESS_INFORMATION_PREFIX);
+    }
+    for (attempt = 0UL; attempt < 4UL; ++attempt) {
+        PVOID snapshot = NULL;
+        ULONG allocationBytes = 0UL;
+        ULONG returnedBytes = 0UL;
+
+        /* 留出两次查询之间新起进程的余量。 */
+        if (requiredBytes > KSW_HVM_PROCESS_RESOLVE_SNAPSHOT_LIMIT - 65536UL) {
+            /* 返回明确的资源上限失败。 */
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        allocationBytes = requiredBytes + 65536UL;
+        snapshot = KswordARKAllocateNonPagedPool(
+            allocationBytes,
+            KSW_HVM_PROCESS_RESOLVE_POOL_TAG);
+        if (snapshot == NULL) {
+            /* 返回明确的分配失败。 */
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+        RtlZeroMemory(snapshot, allocationBytes);
+        status = ZwQuerySystemInformation(
+            KSW_HVM_PROCESS_INFORMATION_CLASS,
+            snapshot,
+            allocationBytes,
+            &returnedBytes);
+        if (NT_SUCCESS(status)) {
+            /* 把回报长度钳进实际分配范围，遍历才不会越界。 */
+            if (returnedBytes == 0UL || returnedBytes > allocationBytes) {
+                returnedBytes = allocationBytes;
+            }
+            *SnapshotOut = snapshot;
+            *SnapshotBytesOut = returnedBytes;
+            /* 完成一次完整的快照。 */
+            return STATUS_SUCCESS;
+        }
+        ExFreePoolWithTag(snapshot, KSW_HVM_PROCESS_RESOLVE_POOL_TAG);
+        /* 只对"缓冲不够"重试，别的失败原样返回。 */
+        if (status != STATUS_INFO_LENGTH_MISMATCH &&
+            status != STATUS_BUFFER_TOO_SMALL) {
+            /* 返回查询本身的失败。 */
+            return status;
+        }
+        requiredBytes = returnedBytes > allocationBytes
+            ? returnedBytes
+            : allocationBytes;
+    }
+    /* 重试用尽，如实回报最后一次的失败。 */
+    return status;
+}
+
+/*
+ * 把一个观测到的 CR3 归到一个 PID 上。
+ *
+ * 判据只有一条：attach 进那个进程、读回处理器实际在用的 CR3、和给定值比页帧。
+ * 不读 EPROCESS 里的任何字段——Windows 不公开 DirectoryTableBase 的稳定偏移，
+ * 而读错了字段的后果不是崩溃，是一个照样能走页表、照样能给出物理地址的错值。
+ *
+ * ScannedOut 单独回报，因为"扫过都不是它"与"一个都没扫成"要人做的事相反。
+ */
+static NTSTATUS
+KswordARKHvmProcessResolveDirectoryBase(
+    _In_ ULONGLONG DirectoryBase,
+    _Out_ ULONG* ProcessIdOut,
+    _Out_ ULONG* ScannedOut
+    )
+{
+    PVOID snapshot = NULL;
+    ULONG snapshotBytes = 0UL;
+    ULONG offset = 0UL;
+    ULONG scanned = 0UL;
+    ULONGLONG target = DirectoryBase & KSW_HVM_PROCESS_CR3_FRAME_MASK;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    /* 拒绝不完整的调用契约。 */
+    if (ProcessIdOut == NULL || ScannedOut == NULL) {
+        /* 返回明确的契约失败。 */
+        return STATUS_INVALID_PARAMETER;
+    }
+    *ProcessIdOut = 0UL;
+    *ScannedOut = 0UL;
+    /* 零不是任何进程的页目录基址，不值得为它扫一遍。 */
+    if (target == 0ULL) {
+        /* 返回明确的参数失败。 */
+        return STATUS_INVALID_PARAMETER;
+    }
+    status = KswordARKHvmProcessCaptureSnapshot(&snapshot, &snapshotBytes);
+    /* 快照拿不到就如实失败，扫描数保持 0。 */
+    if (!NT_SUCCESS(status)) {
+        /* 返回快照本身的失败。 */
+        return status;
+    }
+    while (offset + sizeof(KSW_HVM_PROCESS_INFORMATION_PREFIX) <= snapshotBytes) {
+        const KSW_HVM_PROCESS_INFORMATION_PREFIX* entry =
+            (const KSW_HVM_PROCESS_INFORMATION_PREFIX*)
+                ((PUCHAR)snapshot + offset);
+        ULONG processId = (ULONG)(ULONG_PTR)entry->UniqueProcessId;
+        ULONG entryBytes = entry->NextEntryOffset;
+        ULONGLONG candidate = 0ULL;
+
+        /* Idle 没有可 attach 的地址空间，跳过而不是让 attach 去失败。 */
+        if (processId != KSW_HVM_PROCESS_PID_IDLE) {
+            if (NT_SUCCESS(KswordARKHvmMemoryResolveProcessDirectoryBase(
+                    processId,
+                    &candidate))) {
+                ++scanned;
+                if ((candidate & KSW_HVM_PROCESS_CR3_FRAME_MASK) == target) {
+                    *ProcessIdOut = processId;
+                    *ScannedOut = scanned;
+                    ExFreePoolWithTag(
+                        snapshot,
+                        KSW_HVM_PROCESS_RESOLVE_POOL_TAG);
+                    /* 完成一次成功的归因。 */
+                    return STATUS_SUCCESS;
+                }
+            }
+        }
+        /* 偏移为零是链表结尾；不前进就会原地打转。 */
+        if (entryBytes == 0UL || entryBytes > snapshotBytes - offset) {
+            break;
+        }
+        offset += entryBytes;
+    }
+    ExFreePoolWithTag(snapshot, KSW_HVM_PROCESS_RESOLVE_POOL_TAG);
+    *ScannedOut = scanned;
+    /* 扫完了没有匹配。这不是错误，是一个确定的答案。 */
+    return STATUS_NOT_FOUND;
+}
 
 /* 找一条命中给定层次基址的处置。退出路径与控制路径共用。 */
 static KSW_HVM_PROCESS_SLOT*
@@ -387,9 +594,16 @@ KswordARKHvmProcessControlLocked(
     Response->size = sizeof(*Response);
     Response->generation = Runtime->Generation;
     Response->stateFlags = (ULONGLONG)Runtime->StateFlags;
-    /* 校验完整的版本化请求契约。 */
+    /*
+     * 校验完整的版本化请求契约。
+     *
+     * directoryBase 只属于 RESOLVE_CR3，而那条操作走在这个函数外面。所以到了
+     * 这里它必须是零：带着值进来说明调用方把两种操作的请求搞混了，而那种混淆
+     * 在这些操作上恰好不会有任何症状——字段根本不会被读。
+     */
     if (Request->version != KSWORD_ARK_HVM_PROCESS_PROTOCOL_VERSION ||
-        Request->size != sizeof(*Request)) {
+        Request->size != sizeof(*Request) ||
+        Request->directoryBase != 0ULL) {
         Response->status =
             KSWORD_ARK_HVM_PROCESS_STATUS_INVALID_REQUEST;
         /* 返回明确的契约失败。 */
@@ -493,6 +707,57 @@ KswordARKHvmProcessControl(
     if (Request == NULL || Response == NULL || runtime == NULL) {
         /* 返回明确的契约失败。 */
         return STATUS_INVALID_PARAMETER;
+    }
+    /*
+     * CR3 归因走在锁外面，而且走在 Initialized 检查前面。
+     *
+     * 两个理由，都不是优化。它一个字节的 HVM 状态都不碰，把它放进临界区意味着
+     * 一次几百个进程的 attach 遍历全程压着那把与退出路径共用的锁。而"必须先
+     * prepare 才能归因"更是把事情办反了：最需要归因的时刻恰恰是常驻已经停下、
+     * 用户正在看命中记录的那一刻。
+     */
+    if (Request->operation == KSWORD_ARK_HVM_PROCESS_OP_RESOLVE_CR3) {
+        ULONG resolvedProcessId = 0UL;
+        ULONG scanned = 0UL;
+
+        RtlZeroMemory(Response, sizeof(*Response));
+        Response->version = KSWORD_ARK_HVM_PROCESS_PROTOCOL_VERSION;
+        Response->size = sizeof(*Response);
+        /*
+         * 这条路径绕开了 ControlLocked，所以版本与字段契约要在这里自己校验
+         * 一遍。绕开检查的分支不会有任何症状——它照样返回一个格式正确的响应。
+         */
+        if (Request->version != KSWORD_ARK_HVM_PROCESS_PROTOCOL_VERSION ||
+            Request->size != sizeof(*Request) ||
+            Request->processId != 0UL ||
+            Request->guestLinearAddress != 0ULL) {
+            Response->status =
+                KSWORD_ARK_HVM_PROCESS_STATUS_INVALID_REQUEST;
+            Response->lastStatus = STATUS_INVALID_PARAMETER;
+            /* 协议层成功，语义层拒绝。 */
+            return STATUS_SUCCESS;
+        }
+        status = KswordARKHvmProcessResolveDirectoryBase(
+            Request->directoryBase,
+            &resolvedProcessId,
+            &scanned);
+        Response->resolvedProcessId = resolvedProcessId;
+        Response->resolvedScannedProcesses = scanned;
+        Response->lastStatus = status;
+        if (NT_SUCCESS(status)) {
+            Response->status = KSWORD_ARK_HVM_PROCESS_STATUS_OK;
+        } else if (status == STATUS_NOT_FOUND) {
+            /* 扫过了没匹配上。scanned 是这句话的证据。 */
+            Response->status = KSWORD_ARK_HVM_PROCESS_STATUS_NOT_FOUND;
+        } else if (status == STATUS_INVALID_PARAMETER) {
+            Response->status = KSWORD_ARK_HVM_PROCESS_STATUS_INVALID_REQUEST;
+        } else {
+            /* 连快照都没拿到。scanned 保持 0，两者由此区分得开。 */
+            Response->status =
+                KSWORD_ARK_HVM_PROCESS_STATUS_PROCESS_LOOKUP_FAILED;
+        }
+        /* 协议层恒定成功，语义结果全在 status 与两个计数里。 */
+        return STATUS_SUCCESS;
     }
     /*
      * 只有**安装**受"常驻停着"的限制。

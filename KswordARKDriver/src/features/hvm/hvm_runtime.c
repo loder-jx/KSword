@@ -1,4 +1,4 @@
-/*++
+﻿/*++
 
 Module Name:
 
@@ -2217,6 +2217,19 @@ KswordARKHvmControlStatusFromNtStatus(
     if (Status == STATUS_HV_FEATURE_UNAVAILABLE) {
         return KSWORD_ARK_HVM_CONTROL_STATUS_HYPERVISOR_CONFLICT;
     }
+    /*
+     * The identity window is too small for this machine's address space.
+     *
+     * Mapped before the NOT_SUPPORTED case on purpose, and carried by its own
+     * NTSTATUS for the same reason: every other refusal on the residency path
+     * collapses into UNSUPPORTED_CPU, and this one is the opposite statement -
+     * the processor is fine, our window is not.  Falling through to the
+     * command catch-all below would be worse still: START_RESIDENT would
+     * report RENDEZVOUS_FAILED for something that never reached a rendezvous.
+     */
+    if (Status == STATUS_SECTION_TOO_BIG) {
+        return KSWORD_ARK_HVM_CONTROL_STATUS_EPT_WINDOW_TOO_SMALL;
+    }
     if (Status == STATUS_NOT_SUPPORTED) {
         if (Command ==
             KSWORD_ARK_HVM_CONTROL_VALIDATE_NESTED) {
@@ -3428,6 +3441,13 @@ Complete:
     UNREFERENCED_PARAMETER(overwrittenEventCount);
     UNREFERENCED_PARAMETER(publishedEventCount);
     Response->eptPageCount = g_KswordHvm.EptPageCount;
+    /*
+     * Published on every control call, not only on the refusal that needs it.
+     *
+     * A field that only carries a value when something went wrong has no
+     * occasion on which it can be shown to be right.
+     */
+    Response->eptPml4EntryBudget = KSW_HVM_MAX_PML4_ENTRIES;
     Response->eptPointer = g_KswordHvm.EptPointer;
     Response->mappedRamBytes = g_KswordHvm.MappedRamBytes;
     Response->vmExitCount = KswordARKHvmTotalVmExitCountLocked();
@@ -3560,7 +3580,17 @@ KswordARKHvmEptRuleControl(
             ~(KSWORD_ARK_HVM_EPT_RULE_FLAG_LOG |
               KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE |
               KSWORD_ARK_HVM_EPT_RULE_FLAG_UI_CONFIRMED |
-              KSWORD_ARK_HVM_EPT_RULE_FLAG_ENFORCE)) != 0UL ||
+              KSWORD_ARK_HVM_EPT_RULE_FLAG_ENFORCE |
+              /*
+               * 白名单必须是**自用位的超集**。
+               *
+               * WATCH_ONCE 与 REARM / WATCH_QUERY 起初只加进了协议头和内层的
+               * ...Locked 函数，这道外层契约门没跟着改，于是每一条 watch 请求
+               * 都在到达处置逻辑之前被判 STATUS_INVALID_PARAMETER，用户侧只
+               * 看到 win32=87。离线测试抓不到它：这道门没有宿主侧对应物，
+               * 加多少断言都跑不到这一行。实机第一次调用才暴露。
+               */
+              KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE)) != 0UL ||
         (Request->operation !=
             KSWORD_ARK_HVM_EPT_RULE_ADD &&
          Request->operation !=
@@ -3568,8 +3598,54 @@ KswordARKHvmEptRuleControl(
          Request->operation !=
             KSWORD_ARK_HVM_EPT_RULE_CLEAR &&
          Request->operation !=
-            KSWORD_ARK_HVM_EPT_RULE_QUERY)) {
+            KSWORD_ARK_HVM_EPT_RULE_QUERY &&
+         Request->operation !=
+            KSWORD_ARK_HVM_EPT_RULE_REARM &&
+         Request->operation !=
+            KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY)) {
         /* Return the exact fixed-contract failure. */
+        return STATUS_INVALID_PARAMETER;
+    }
+    /*
+     * 读整张 watch 表与读一条规则同类：除了协议头，任何字段带值都说明调用方
+     * 把它当成了别的操作，宁可拒绝也不要按一个说不清的请求去读。
+     */
+    if (Request->operation ==
+            KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY &&
+        (Request->flags != 0UL ||
+         Request->confirmationToken != 0UL ||
+         Request->expectedGeneration != 0UL ||
+         Request->ruleId != 0UL ||
+         Request->deniedAccess != 0UL ||
+         Request->physicalAddress != 0ULL ||
+         Request->pageCount != 0ULL ||
+         Request->requestedAddress != 0ULL ||
+         Request->requestedLength != 0ULL ||
+         Request->requestedAccess != 0UL ||
+         Request->addressKind != 0UL)) {
+        /* Return the exact operation-field contract failure. */
+        return STATUS_INVALID_PARAMETER;
+    }
+    /*
+     * 重新武装只按编号找已有记录，它的访问类型、页地址与请求范围都来自安装时
+     * 存下来的那一份。请求里再带一遍这些字段，说明调用方以为自己能在这一步
+     * 改掉它们——那正是必须拒绝的误解：改了也不会生效。
+     */
+    if (Request->operation ==
+            KSWORD_ARK_HVM_EPT_RULE_REARM &&
+        (Request->ruleId == 0UL ||
+         Request->deniedAccess != 0UL ||
+         Request->physicalAddress != 0ULL ||
+         Request->pageCount != 0ULL ||
+         Request->requestedAddress != 0ULL ||
+         Request->requestedLength != 0ULL ||
+         Request->requestedAccess != 0UL ||
+         Request->addressKind != 0UL ||
+         (Request->flags &
+            (KSWORD_ARK_HVM_EPT_RULE_FLAG_LOG |
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE |
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE)) != 0UL)) {
+        /* Return the exact re-arm contract failure. */
         return STATUS_INVALID_PARAMETER;
     }
     /* Reject fields that are meaningless for a read-only rule query. */
@@ -3580,7 +3656,11 @@ KswordARKHvmEptRuleControl(
          Request->expectedGeneration != 0UL ||
          Request->deniedAccess != 0UL ||
          Request->physicalAddress != 0ULL ||
-         Request->pageCount != 0ULL)) {
+         Request->pageCount != 0ULL ||
+         Request->requestedAddress != 0ULL ||
+         Request->requestedLength != 0ULL ||
+         Request->requestedAccess != 0UL ||
+         Request->addressKind != 0UL)) {
         /* Return the exact operation-field contract failure. */
         return STATUS_INVALID_PARAMETER;
     }
@@ -3591,9 +3671,14 @@ KswordARKHvmEptRuleControl(
          Request->deniedAccess != 0UL ||
          Request->physicalAddress != 0ULL ||
          Request->pageCount != 0ULL ||
+         Request->requestedAddress != 0ULL ||
+         Request->requestedLength != 0ULL ||
+         Request->requestedAccess != 0UL ||
+         Request->addressKind != 0UL ||
          (Request->flags &
             (KSWORD_ARK_HVM_EPT_RULE_FLAG_LOG |
-             KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE)) != 0UL)) {
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE |
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE)) != 0UL)) {
         /* Return the exact removal-field contract failure. */
         return STATUS_INVALID_PARAMETER;
     }
@@ -3604,9 +3689,14 @@ KswordARKHvmEptRuleControl(
          Request->deniedAccess != 0UL ||
          Request->physicalAddress != 0ULL ||
          Request->pageCount != 0ULL ||
+         Request->requestedAddress != 0ULL ||
+         Request->requestedLength != 0ULL ||
+         Request->requestedAccess != 0UL ||
+         Request->addressKind != 0UL ||
          (Request->flags &
             (KSWORD_ARK_HVM_EPT_RULE_FLAG_LOG |
-             KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE)) != 0UL)) {
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE |
+             KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE)) != 0UL)) {
         /* Return the exact clear-field contract failure. */
         return STATUS_INVALID_PARAMETER;
     }
@@ -3672,6 +3762,17 @@ KswordARKHvmEptRuleControl(
         status = STATUS_SUCCESS;
     } else if (Request->operation !=
                    KSWORD_ARK_HVM_EPT_RULE_QUERY &&
+               /*
+                * Reading the watch table has to work WHILE resident - that is
+                * the entire window in which a hit can happen.  Excluding it
+                * from the freeze would mean a watch could fire and nothing
+                * could ever be read back until residency stopped.
+                *
+                * Safe for the same reason the plain query is: it only reads
+                * the rule records, publishes no field, and touches no leaf.
+                */
+               Request->operation !=
+                   KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY &&
                InterlockedCompareExchange(
                    &g_KswordHvm.ResidentProcessorCount,
                    0L,
@@ -3685,9 +3786,17 @@ KswordARKHvmEptRuleControl(
         /* Publish the fixed response identity for the fail-closed rejection. */
         Response->version = KSWORD_ARK_HVM_PROTOCOL_VERSION;
         Response->size = sizeof(*Response);
-        /* Reuse the existing partial result with authoritative busy detail. */
+        /*
+         * Say what actually happened: the table is frozen for the duration of
+         * residency and nothing was attempted.
+         *
+         * This used to report PARTIAL, whose text is "some processors did not
+         * complete the invalidation" - a description of an event that never
+         * occurred, pointing whoever reads it at the invalidation machinery
+         * instead of at the one action that resolves it: stop residency first.
+         */
         Response->status =
-            KSWORD_ARK_HVM_EPT_RULE_STATUS_PARTIAL;
+            KSWORD_ARK_HVM_EPT_RULE_STATUS_RESIDENT_FROZEN;
         Response->lastStatus = STATUS_DEVICE_BUSY;
         /* No rule, split entry, generation, or EPT translation was changed. */
         status = STATUS_SUCCESS;

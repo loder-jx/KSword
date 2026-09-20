@@ -558,6 +558,22 @@
 #define KSWORD_ARK_HVM_CONTROL_STATUS_LOCAL_EPT_CONFLICTS_WITH_VMFUNC 26UL
 /* Nested VMX composes its own EPT pointer and cannot share this mechanism. */
 #define KSWORD_ARK_HVM_CONTROL_STATUS_LOCAL_EPT_CONFLICTS_WITH_NESTED 27UL
+/*
+ * 这台机器的客户物理地址空间比这一版能建的身份映射窗口大。
+ *
+ * 与 UNSUPPORTED_CPU 分家，因为它们要人做的事**相反**：那个说"换一台机器"，
+ * 这个说"这台机器什么都支持，是我们的窗口太小"。
+ *
+ * 两者混在一起的代价是实测过的：一台 Intel Core Ultra 报 CPUID.80000008H:EAX
+ * 的物理地址宽度是 45 位（32 TiB），而当时的窗口是 8 TiB，于是构建器截断、
+ * 置 EPT_TRUNCATED、常驻拒绝，一路翻译成"处理器不支持"——由一台每一项能力
+ * 都齐备的处理器说出来。用户只能去查 CPU 和 BIOS，而那两处都没有问题。
+ *
+ * 界面看到这个码时要说出三个数：本机的物理地址宽度（用户态一条 CPUID 就读得
+ * 到）、这一版实际映射到哪里（查询响应里的 highestMappedPhysicalAddress）、
+ * 以及需要多少个 PML4 项。
+ */
+#define KSWORD_ARK_HVM_CONTROL_STATUS_EPT_WINDOW_TOO_SMALL 28UL
 
 #define KSWORD_ARK_HVM_EXIT_REASON_NONE   0xFFFFFFFFUL
 #define KSWORD_ARK_HVM_EXIT_REASON_VMCALL 18UL
@@ -575,6 +591,15 @@
 #define KSWORD_ARK_HVM_EPT_RULE_REMOVE 2UL
 #define KSWORD_ARK_HVM_EPT_RULE_CLEAR  3UL
 #define KSWORD_ARK_HVM_EPT_RULE_QUERY  4UL
+/*
+ * 把一条已经命中过的 WATCH_ONCE 规则重新武装。
+ *
+ * 不是"再 ADD 一条"：watchId 要保持不变，历史命中计数也要留着，否则用户在
+ * 界面上看到的是一条新记录，而"同一个目标被动过几次"正是这个功能要回答的。
+ */
+#define KSWORD_ARK_HVM_EPT_RULE_REARM  5UL
+/* 读回整张 watch 表。普通 QUERY 一次只回一条，列表页要的是全部。 */
+#define KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY 6UL
 
 #define KSWORD_ARK_HVM_EPT_RULE_FLAG_LOG          0x00000001UL
 #define KSWORD_ARK_HVM_EPT_RULE_FLAG_ALLOW_ONCE   0x00000002UL
@@ -596,6 +621,75 @@
  * is unavailable the rule falls back to tripwire behavior.
  */
 #define KSWORD_ARK_HVM_EPT_RULE_FLAG_ENFORCE      0x00000008UL
+/*
+ * WATCH_ONCE：首次访问归因（first-touch attribution）。
+ *
+ * 与同一页上的另外三种处置都不同，值得逐条对照：
+ *
+ * - 严格 tripwire 命中后**退出虚拟化**。作为安全兜底是对的——它保证 guest 最终
+ *   一定能完成那次访问——但作为用户层的"看看下次是谁动它"就完全不能用：抓到
+ *   一次访问的代价是整台机器的 VMM 没了。
+ * - ALLOW_ONCE 放行一条指令再用 monitor-trap 把权限收回来。它要 MTF，而嵌套
+ *   Hyper-V 实测不给 MTF，所以在靶机上恒不可用；多核共享层次下那个放宽窗口
+ *   还是全机可见的。
+ * - ENFORCE 是持久拒绝，注 #PF —— 已被判 UNIMPLEMENTED（活锁）。
+ *
+ * WATCH_ONCE 正好是"ALLOW_ONCE 去掉收回那一步"：
+ *
+ *     EPT violation
+ *         ↓
+ *     原子 ARMED → TRIGGERED（只有一个 CPU 赢）
+ *         ↓
+ *     把这一页的权限**永久**恢复（这条规则从此不再拒绝）
+ *         ↓
+ *     INVEPT
+ *         ↓
+ *     RIP 不推进，VMRESUME
+ *         ↓
+ *     原指令重执行并正常完成；常驻继续
+ *
+ * 因为没有"再收回来"这一步，它**不需要 MTF**，也就不需要那道"单核或私有层次"
+ * 的门：权限是朝放开方向单向变化的，别的处理器提前看到放开的权限，结果只是
+ * 它们那次访问也正常完成——而这条 watch 本来就已经决定不再拦了。
+ *
+ * 语义上它**不是**安全边界：它不阻止访问，只记录一次现场然后让路。
+ */
+#define KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE   0x00000010UL
+
+/*
+ * Watch 生命周期。
+ *
+ * 单靠"规则在不在表里"表达不了这条时间线：命中之后规则必须留在表里（要报
+ * hitCount 和最近一次命中的现场），但它已经不拦任何访问了。两件事必须分开。
+ */
+#define KSWORD_ARK_HVM_EPT_WATCH_STATE_NONE        0UL
+/* 已装上并正在拦截，等待第一次访问。 */
+#define KSWORD_ARK_HVM_EPT_WATCH_STATE_ARMED       1UL
+/* 某个 CPU 赢下了原子转换，正在恢复权限。瞬时态。 */
+#define KSWORD_ARK_HVM_EPT_WATCH_STATE_TRIGGERED   2UL
+/* 已命中并解除，权限已恢复。要再看下一次必须显式 REARM。 */
+#define KSWORD_ARK_HVM_EPT_WATCH_STATE_DISARMED    3UL
+/*
+ * 常驻停过/释放过/故障过，这条 watch 绑定的那一代已经不存在了。
+ *
+ * 与 DISARMED 分开是因为两者对用户意味着完全不同的事：DISARMED 是"目标被动过
+ * 了，证据在这儿"，INVALIDATED 是"我什么都没看到，因为中途没人在看"。把后者
+ * 显示成前者，等于报告一次不存在的观测结果。
+ */
+#define KSWORD_ARK_HVM_EPT_WATCH_STATE_INVALIDATED 4UL
+/* 安装期就失败，没有进入过拦截。 */
+#define KSWORD_ARK_HVM_EPT_WATCH_STATE_FAULTED     5UL
+
+/* 命中时事件成功发布。 */
+#define KSWORD_ARK_HVM_EPT_WATCH_HIT_NONE      0UL
+#define KSWORD_ARK_HVM_EPT_WATCH_HIT_PUBLISHED 1UL
+/*
+ * 命中了，但事件环没接住。
+ *
+ * 必须与"从未命中"分开：两者在事件列表里长得一模一样（都是没有事件），而
+ * 结论正好相反——一个是目标没被动过，一个是目标被动过但证据丢了。
+ */
+#define KSWORD_ARK_HVM_EPT_WATCH_HIT_EVENT_LOST 2UL
 
 #define KSWORD_ARK_HVM_EPT_RULE_STATUS_OK                    0UL
 #define KSWORD_ARK_HVM_EPT_RULE_STATUS_INVALID_REQUEST       1UL
@@ -640,6 +734,27 @@
  * 的多核，都照旧放行。
  */
 #define KSWORD_ARK_HVM_EPT_RULE_STATUS_MULTIPROCESSOR_UNSAFE 9UL
+/*
+ * 这一页已经被别的 EPT 机制占着（分离视图、执行域、或另一条 watch）。
+ *
+ * 不做自动合并，也不静默覆盖：两套机制对同一个叶项的期望值不同，谁后写谁赢，
+ * 而赢的那一方会在对方毫不知情的情况下把对方的功能改掉。一页一个明确的主人，
+ * 冲突时直接说清楚是谁占着，让用户自己决定先撤哪一个。
+ */
+#define KSWORD_ARK_HVM_EPT_RULE_STATUS_LEAF_CONFLICT         10UL
+/*
+ * 常驻正在跑，而规则表在整个常驻期间是冻结的。
+ *
+ * 这不是"部分成功"：一个字段都没改过。它原先复用 PARTIAL（"部分处理器未能完成
+ * 失效"）上报，而那句话描述的是一件根本没发生的事，还把用户引向失效机制去查。
+ *
+ * 冻结本身不是保守，是必需的：常驻期间的 VM-exit 路径不取 PASSIVE 级别的锁就
+ * 扫规则表与 split 叶，PASSIVE 侧同时改它就是一场没有诊断面的竞争。
+ *
+ * 所以所有 EPT 规则（含内存监视）的安装、重新武装、移除都在常驻停着时做，
+ * 启动常驻后生效——这与分离视图、MSR 策略、CR 策略的窗口期是同一个。
+ */
+#define KSWORD_ARK_HVM_EPT_RULE_STATUS_RESIDENT_FROZEN       11UL
 
 #define KSWORD_ARK_HVM_EVENT_TYPE_VMEXIT          1UL
 #define KSWORD_ARK_HVM_EVENT_TYPE_EPT_VIOLATION   2UL
@@ -985,7 +1100,20 @@ typedef struct _KSWORD_ARK_CONTROL_HVM_RESPONSE
     unsigned char launchProcessorNumber;
     unsigned char launchWasNested;
     long lastStatus;
-    unsigned long reserved2;
+    /*
+     * 本驱动的身份映射窗口有多少个 PML4 项，每项 512 GiB。
+     *
+     * 占用原先的 reserved2 槽位（没有任何读写方），结构大小不变，协议版本不动。
+     *
+     * 存在的理由只有一个：配 EPT_WINDOW_TOO_SMALL 时，界面要说得出"本机需要多少
+     * 项、这一版有多少项"。前者界面自己用一条 CPUID 就算得出来，后者算不出——
+     * 它是**这个驱动**编译时的常量，而一个从旧头文件构建的界面手里的那个值正好
+     * 是错的。恰恰在版本不齐时这条消息最需要准确。
+     *
+     * 每次控制调用都填，不只在失败时填：一个只在出事时才有值的字段，没出事的
+     * 时候没有任何地方能确认它是对的。
+     */
+    unsigned long eptPml4EntryBudget;
     /* Milliseconds residency actually held during the last soak. */
     unsigned long soakElapsedMilliseconds;
     /*
@@ -1015,7 +1143,92 @@ typedef struct _KSWORD_ARK_HVM_EPT_RULE_REQUEST
     unsigned long deniedAccess;
     unsigned long long physicalAddress;
     unsigned long long pageCount;
+    /*
+     * ——— 以下字段只服务于 WATCH_ONCE，其余处置一律忽略 ———
+     *
+     * 它们记录的是**用户请求的东西**，而不是硬件实际监视的东西。这两者在 EPT
+     * 上永远不相等：EPT 权限是 4 KiB 页粒度，而用户往往是从一个 8 字节的
+     * DriverObject->MajorFunction[14] 建的 watch。驱动不会因为存了这两个值就
+     * 监视得更细；存它们是为了让命中之后能回答"这次访问落没落在你真正关心的
+     * 那几个字节上"，以及让界面能如实地把两套数字并排显示出来。
+     *
+     * 把它们丢掉、只留页地址，界面就只能把一次页内其它偏移的访问说成"你的
+     * 目标被访问了"——那是一句读起来完全正确、实际上可能完全不相干的话。
+     */
+    unsigned long long requestedAddress;
+    unsigned long long requestedLength;
+    /*
+     * 用户勾的那几项，未经架构归一化。
+     *
+     * deniedAccess 是归一化之后的**实际**生效掩码（去掉 READ 必然连带去掉
+     * WRITE，没有 execute-only 时还要连带去掉 EXECUTE）。两者必须都留着：
+     * 只留归一化后的值，界面就会把"你要求监视读"显示成"你要求监视读写"，
+     * 那是替用户改了他的请求；只留请求值，界面又会谎称只监视了读。
+     */
+    unsigned long requestedAccess;
+    /* 请求用的地址种类，见 KSWORD_ARK_HVM_WATCH_ADDRESS_*。仅作回显。 */
+    unsigned long addressKind;
 } KSWORD_ARK_HVM_EPT_RULE_REQUEST;
+
+/* requestedAddress 是内核虚拟地址，安装时由驱动翻译成物理页。 */
+#define KSWORD_ARK_HVM_WATCH_ADDRESS_VIRTUAL  0UL
+/* requestedAddress 就是物理地址，不做翻译。 */
+#define KSWORD_ARK_HVM_WATCH_ADDRESS_PHYSICAL 1UL
+
+/* 一次 watch 表快照里最多回报多少条。 */
+#define KSWORD_ARK_HVM_MAX_EPT_WATCH_ROWS 32UL
+
+/* 一条 watch 的完整协议快照。 */
+typedef struct _KSWORD_ARK_HVM_EPT_WATCH_ROW
+{
+    /* 与 ruleId 同一个值：watch 就是一条带 WATCH_ONCE 处置的 EPT 规则。 */
+    unsigned long watchId;
+    /* 见 KSWORD_ARK_HVM_EPT_WATCH_STATE_*。 */
+    unsigned long state;
+    /* 用户请求的访问类型，未归一化。 */
+    unsigned long requestedAccess;
+    /* 实际装到 EPT 上的访问类型，已归一化。 */
+    unsigned long effectiveAccess;
+    /* 安装时的地址种类。 */
+    unsigned long addressKind;
+    /*
+     * 累计命中次数。
+     *
+     * 一条 one-shot watch 正常只会到 1；REARM 之后继续累加，所以它回答的是
+     * "这个目标一共被动过几次"，而不是"当前这一轮有没有命中"。
+     */
+    unsigned long hitCount;
+    /* 最近一次命中的事件序号；配合 lastHitStatus 判断证据在不在。 */
+    unsigned long long lastHitSequence;
+    /* 见 KSWORD_ARK_HVM_EPT_WATCH_HIT_*。 */
+    unsigned long lastHitStatus;
+    /*
+     * 武装这一轮时的 HVM 代次。
+     *
+     * 常驻停过、释放过、故障过都会推进代次；代次对不上就说明这条 watch 跨过了
+     * 一次"没有人在看"的空档，此时它报的任何"未命中"都不成立。
+     */
+    unsigned long armedGeneration;
+    /* 用户请求的地址与长度，原样回显。 */
+    unsigned long long requestedAddress;
+    unsigned long long requestedLength;
+    /* 实际监视的物理页与页内偏移。 */
+    unsigned long long physicalPage;
+    unsigned long long pageCount;
+    /* 最近一次命中的现场，够界面直接列出来而不必再去翻事件环。 */
+    unsigned long long lastHitRip;
+    unsigned long long lastHitGuestLinearAddress;
+    unsigned long long lastHitGuestPhysicalAddress;
+    unsigned long long lastHitCr3;
+    unsigned long long lastHitRsp;
+    unsigned long long lastHitTimestamp;
+    unsigned short lastHitProcessorGroup;
+    unsigned char lastHitProcessorNumber;
+    /* 命中时 CPU 是否报告了有效的客户线性地址。 */
+    unsigned char lastHitGuestLinearValid;
+    /* 命中的 GLA 是否落在 requestedAddress/Length 之内。 */
+    unsigned long lastHitRangeMatch;
+} KSWORD_ARK_HVM_EPT_WATCH_ROW;
 
 typedef struct _KSWORD_ARK_HVM_EPT_RULE_RESPONSE
 {
@@ -1034,7 +1247,34 @@ typedef struct _KSWORD_ARK_HVM_EPT_RULE_RESPONSE
     unsigned long long pageCount;
     long lastStatus;
     unsigned long reserved2;
+    /*
+     * ——— 以下字段服务于 WATCH_ONCE ———
+     *
+     * 追加在结构尾部而不是插进中间：中间插字段会让所有既有字段的偏移平移，
+     * 而增量构建出来的 .sys 与 GUI 只要有一边没重建，读到的就是错位的值——
+     * 那种故障没有任何编译期或运行期提示。
+     */
+    /* 占着这一页的另一个机制的标识，仅在 LEAF_CONFLICT 时有意义。 */
+    unsigned long conflictOwnerId;
+    /* 见 KSWORD_ARK_HVM_WATCH_CONFLICT_*。 */
+    unsigned long conflictOwnerKind;
+    /* WATCH_QUERY 回报的条数，以及表内总条数。 */
+    unsigned long returnedWatchRows;
+    unsigned long watchRowCount;
+    /* 单条操作（ADD / REARM / QUERY）回报的那一条 watch 的完整快照。 */
+    KSWORD_ARK_HVM_EPT_WATCH_ROW watch;
+    /* WATCH_QUERY 专用。 */
+    KSWORD_ARK_HVM_EPT_WATCH_ROW watchRows[KSWORD_ARK_HVM_MAX_EPT_WATCH_ROWS];
 } KSWORD_ARK_HVM_EPT_RULE_RESPONSE;
+
+/* 这一页没有别的主人。 */
+#define KSWORD_ARK_HVM_WATCH_CONFLICT_NONE   0UL
+/* 被一条 EPT 分离视图（CLOAK / HOOK）占着。 */
+#define KSWORD_ARK_HVM_WATCH_CONFLICT_VIEW   1UL
+/* 被另一条 EPT 规则占着。 */
+#define KSWORD_ARK_HVM_WATCH_CONFLICT_RULE   2UL
+/* 被另一条 watch 占着。 */
+#define KSWORD_ARK_HVM_WATCH_CONFLICT_WATCH  3UL
 
 typedef struct _KSWORD_ARK_HVM_EVENT_ROW
 {
@@ -1053,7 +1293,38 @@ typedef struct _KSWORD_ARK_HVM_EVENT_ROW
     unsigned long ruleId;
     long status;
     unsigned long reserved1;
+    /*
+     * ——— 以下字段追加于 2026-09-19，服务于 watch 命中归因 ———
+     *
+     * 追加在尾部，既有字段的偏移一个都不动。
+     *
+     * 这三样是**必须在 VM-exit 现场取**的：RSP 和 CR3 一旦 VMRESUME 回去就
+     * 不再是命中那一刻的值，事后从 R0 去问只会得到另一个线程的答案。相对地，
+     * 模块名、符号、PID 这些都**不在**这里——在 VMX root 里解析 Windows 对象
+     * 是拿整台机器冒险，那些留给 R0 普通上下文和 R3 做后处理。
+     */
+    unsigned long long guestRsp;
+    /*
+     * 命中那一刻的 guest CR3。
+     *
+     * 它是"当时处于哪个地址空间"的唯一可信来源，也是 PID 归因的输入。但它只是
+     * 一个观测值：KVA shadow、系统地址空间、内核工作线程、CR3 复用都会让
+     * CR3 → PID 这一步不成立，所以协议只回报观测到的 CR3，把"解析成了哪个
+     * 进程"和"有多大把握"留给上层各自标注。
+     */
+    unsigned long long guestCr3;
+    /* 命中后这条 watch 的状态，见 KSWORD_ARK_HVM_EPT_WATCH_STATE_*。 */
+    unsigned long watchState;
+    /* 见 KSWORD_ARK_HVM_EVENT_FLAG_*。 */
+    unsigned long eventFlags;
 } KSWORD_ARK_HVM_EVENT_ROW;
+
+/* CPU 报告了有效的客户线性地址（EPT violation qualification 位 7）。 */
+#define KSWORD_ARK_HVM_EVENT_FLAG_GLA_VALID   0x00000001UL
+/* 该 GLA 落在用户请求的那一段字节范围内，而不只是落在同一页上。 */
+#define KSWORD_ARK_HVM_EVENT_FLAG_RANGE_MATCH 0x00000002UL
+/* 这一条是 watch 的首次命中。 */
+#define KSWORD_ARK_HVM_EVENT_FLAG_WATCH_HIT   0x00000004UL
 
 typedef struct _KSWORD_ARK_HVM_EVENT_QUERY_REQUEST
 {
@@ -1656,7 +1927,14 @@ typedef struct _KSWORD_ARK_HVM_DOMAIN_RESPONSE
 #define IOCTL_KSWORD_ARK_HVM_PROCESS \
     CTL_CODE(KSWORD_ARK_IOCTL_DEVICE_TYPE, KSWORD_ARK_IOCTL_FUNCTION_HVM_PROCESS, METHOD_BUFFERED, FILE_WRITE_ACCESS)
 
-#define KSWORD_ARK_HVM_PROCESS_PROTOCOL_VERSION 1UL
+/*
+ * 版本 2 加入 CR3 归因（OP_RESOLVE_CR3）。
+ *
+ * 请求与响应都长了，所以版本必须跟着动：旧界面配新驱动会因为 size 对不上被
+ * 当场拒掉，而那正是想要的结果 —— 这两个结构里装的是进程身份，一次"谁多谁少
+ * 几个字节"的静默误读，换来的是把一次访问归到另一个进程头上。
+ */
+#define KSWORD_ARK_HVM_PROCESS_PROTOCOL_VERSION 2UL
 
 /* 只读当前处置表。 */
 #define KSWORD_ARK_HVM_PROCESS_OP_QUERY     0UL
@@ -1685,6 +1963,23 @@ typedef struct _KSWORD_ARK_HVM_DOMAIN_RESPONSE
 #define KSWORD_ARK_HVM_PROCESS_DISPOSITION_RELEASED 3UL
 /* 清空整张表。 */
 #define KSWORD_ARK_HVM_PROCESS_OP_RELEASE_ALL 4UL
+/*
+ * 把一个观测到的 CR3 归到一个进程头上。只读，不碰任何 HVM 状态。
+ *
+ * 存在的理由是内存监视：命中现场记下来的是 CR3，而 CR3 本身对用户没有意义。
+ * 但这件事**只能在驱动里做**——判据是"attach 进去读回来的那个寄存器值"，
+ * 用户态既读不到别的进程的 CR3，也没有别的办法得到同一个判据。
+ *
+ * 这条通路不回报任何进程的 CR3，只回报"哪个 PID 的 CR3 等于你给的这个"。
+ * 方向是单向的：调用方必须先有一个 CR3 才问得出东西来，而 CR3 的唯一来源是
+ * 一次它自己装的监视命中。
+ *
+ * 结果一定是 best-effort，§十一列的每一条都成立：PID 会被回收、地址空间会在
+ * 事件与解析之间消失、内核工作线程借用别人的地址空间跑、KVA Shadow 下用户态
+ * 与内核态用的根本不是同一个 CR3。所以协议只回报"扫了多少个"与"匹配到谁"，
+ * 由界面把它标成推断而不是事实。
+ */
+#define KSWORD_ARK_HVM_PROCESS_OP_RESOLVE_CR3 5UL
 
 #define KSWORD_ARK_HVM_PROCESS_STATUS_OK                    0UL
 #define KSWORD_ARK_HVM_PROCESS_STATUS_INVALID_REQUEST       1UL
@@ -1760,6 +2055,14 @@ typedef struct _KSWORD_ARK_HVM_PROCESS_REQUEST
      * 拒绝等于什么都没做。
      */
     unsigned long long guestLinearAddress;
+    /*
+     * OP_RESOLVE_CR3 要归因的那个 CR3。其余操作必须留零。
+     *
+     * 单独一个字段而不是借 guestLinearAddress：那个字段在别的操作里是线性
+     * 地址，两者都是 64 位、都像地址、互相传错了谁也不会报错——一个指望拿
+     * 页目录基址的比较会安静地永远不匹配，看起来就像"这个进程已经退出了"。
+     */
+    unsigned long long directoryBase;
 } KSWORD_ARK_HVM_PROCESS_REQUEST;
 
 typedef struct _KSWORD_ARK_HVM_PROCESS_RESPONSE
@@ -1774,6 +2077,20 @@ typedef struct _KSWORD_ARK_HVM_PROCESS_RESPONSE
     unsigned long reserved;
     unsigned long long stateFlags;
     KSWORD_ARK_HVM_PROCESS_ROW rows[KSWORD_ARK_HVM_MAX_PROCESS_DISPOSITIONS];
+    /*
+     * OP_RESOLVE_CR3 的结果。放在 rows 后面，所以前面每个字段的偏移都没动。
+     *
+     * resolvedProcessId 为 0 表示没有匹配上（0 是 Idle 进程，永远不会是答案）。
+     */
+    unsigned long resolvedProcessId;
+    /*
+     * 这次实际问过 CR3 的进程数。
+     *
+     * 必须和"匹配到谁"分开回报，否则"扫了 180 个都不是它"与"一个都没扫成"
+     * 在界面上长得一模一样，而这两者要人做的事相反：前者说明那个地址空间已经
+     * 不在了，后者说明这次归因根本没跑起来。
+     */
+    unsigned long resolvedScannedProcesses;
 } KSWORD_ARK_HVM_PROCESS_RESPONSE;
 
 /*

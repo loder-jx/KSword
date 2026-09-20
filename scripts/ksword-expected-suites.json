@@ -24,6 +24,7 @@
     { "name": "M memory evidence",   "minAssertions": 199 },
     { "name": "J injection survey",  "minAssertions": 518 },
     { "name": "HVM ept switch",      "minAssertions": 467 },
+    { "name": "HVM watch",           "minAssertions": 157 },
     { "name": "HOOK patch compose",  "minAssertions": 182 }
   ]
 }

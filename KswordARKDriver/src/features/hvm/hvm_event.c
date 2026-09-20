@@ -97,6 +97,18 @@ KswordARKHvmEventPublish(
     _In_ const KSWORD_ARK_HVM_EVENT_ROW* Event
     )
 {
+    ULONGLONG sequence = 0ULL;
+
+    /* Publish without caring which sequence the row received. */
+    (void)KswordARKHvmEventPublishTracked(Event, &sequence);
+}
+
+BOOLEAN
+KswordARKHvmEventPublishTracked(
+    _In_ const KSWORD_ARK_HVM_EVENT_ROW* Event,
+    _Out_ ULONGLONG* PublishedSequence
+    )
+{
     LONG64 sequence = 0;
     LONG64 observedState = 0;
     LONG64 busyState = 0;
@@ -105,10 +117,16 @@ KswordARKHvmEventPublish(
     KSW_HVM_EVENT_SLOT* slot = NULL;
     LARGE_INTEGER timestamp = { 0 };
 
+    /* Publish no sequence before the ring is touched. */
+    if (PublishedSequence != NULL) {
+        /* Report "not published" until a slot is actually claimed. */
+        *PublishedSequence = 0ULL;
+    }
     /* Reject a missing event without touching the ring. */
-    if (Event == NULL) {
+    if (Event == NULL ||
+        PublishedSequence == NULL) {
         /* Return immediately on an invalid VM-exit publication contract. */
-        return;
+        return FALSE;
     }
     /* Allocate one monotonic sequence with full interlocked ordering. */
     sequence = InterlockedIncrement64(
@@ -122,7 +140,7 @@ KswordARKHvmEventPublish(
         InterlockedIncrement64(
             &g_KswordHvmEvents.DroppedPublications);
         /* Return without indexing the ring with a wrapped value. */
-        return;
+        return FALSE;
     }
     /* Convert the positive sequence to a bounded ring slot. */
     slotIndex = (ULONG)(
@@ -148,7 +166,7 @@ KswordARKHvmEventPublish(
         InterlockedIncrement64(
             &g_KswordHvmEvents.DroppedPublications);
         /* Return without spinning or modifying another writer's slot. */
-        return;
+        return FALSE;
     }
     /* Encode this sequence as the single-writer ownership state. */
     busyState = (LONG64)(
@@ -163,7 +181,7 @@ KswordARKHvmEventPublish(
         InterlockedIncrement64(
             &g_KswordHvmEvents.DroppedPublications);
         /* Preserve the concurrent winner's publication. */
-        return;
+        return FALSE;
     }
     /* Copy the caller-provided fixed payload without allocation. */
     slot->Row = *Event;
@@ -183,6 +201,10 @@ KswordARKHvmEventPublish(
     InterlockedExchange64(
         &slot->PublicationState,
         sequence);
+    /* Report the sequence a reader can use to find this exact row. */
+    *PublishedSequence = (ULONGLONG)sequence;
+    /* Report that the evidence reached the ring. */
+    return TRUE;
 }
 
 NTSTATUS

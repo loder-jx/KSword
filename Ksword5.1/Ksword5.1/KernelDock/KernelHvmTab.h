@@ -83,6 +83,9 @@ private:
     static QString stateText(std::uint32_t flags);
     static QString implementationText(std::uint32_t implementation);
     static QString nestedStateText(std::uint32_t state);
+    // executionStageText：逐 CPU 的执行阶段。AMD 侧「执行状态」那一列用它——
+    // 驱动回报的是 0..7 的序号，摆一个裸数字等于什么都没说。
+    static QString executionStageText(std::uint32_t stage);
     static QString ntStatusText(long status);
     static QString fixedAscii(const char* text, int capacity);
 

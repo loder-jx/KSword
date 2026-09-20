@@ -10,6 +10,8 @@
 #include "../UI/CodeEditorWidget.h"
 #include "../UI/DetailLayoutHost.h"
 #include "../UI/DetailLayoutRegistry.h"
+/* 统一入口：这一页不需要知道 GPA、EPT 叶或 ruleId。 */
+#include "../UI/KvmWatchDialog.h"
 #include "../theme.h"
 
 #include <QAbstractItemView>
@@ -2998,6 +3000,51 @@ void KernelDock::showCallbackEnumContextMenu(const QPoint& localPosition)
     experimentalUnlinkAction->setEnabled(canUseExperimentalUnlink);
     contextMenu.addSeparator();
 
+    /*
+     * 三个监视入口，对应三个不同的问题，不是同一件事的三种口味。
+     *
+     * - 写例程首部：谁把这条回调的代码改了（inline hook 的归因）；
+     * - 执行例程：这条回调下一次真的被调用是什么时候、从哪条指令来的；
+     * - 写注册记录：谁动了注册结构本身（换掉函数指针、摘链）。
+     *
+     * 第三项不是每种回调都有地址可盯。注册 cookie 的类型随注册 API 而变：
+     * ObRegisterCallbacks 的 cookie 确实是注册结构的指针，而 CmRegisterCallbackEx
+     * 给的是一个 LARGE_INTEGER 序号，根本不是地址。把一个序号当虚拟地址去解析，
+     * 结果不是报错而是解析到一页毫不相干的内存并在那里等一辈子 —— 所以这里按
+     * "看起来是不是内核规范地址"来决定开不开，宁可少给一个入口。
+     */
+    const quint64 callbackRoutineAddress = hasSingleActionEntry
+        ? actionEntry->callbackAddress
+        : 0ULL;
+    const quint64 callbackRegistrationAddress = hasSingleActionEntry
+        ? actionEntry->registrationAddress
+        : 0ULL;
+    const bool registrationLooksLikeKernelAddress =
+        callbackRegistrationAddress >= 0xFFFF800000000000ULL;
+    QMenu* watchMenu = contextMenu.addMenu(
+        kernelText("kernel.callback.enum.menu.hvm_watch",
+                   QStringLiteral("HVM 监视：下一次访问")));
+    watchMenu->setStyleSheet(KswordTheme::ContextMenuStyle());
+    QAction* watchRoutineWriteAction = watchMenu->addAction(
+        kernelText("kernel.callback.enum.menu.hvm_watch.routine_write",
+                   QStringLiteral("写入这个回调例程（改代码）")));
+    QAction* watchRoutineExecuteAction = watchMenu->addAction(
+        kernelText("kernel.callback.enum.menu.hvm_watch.routine_execute",
+                   QStringLiteral("执行这个回调例程")));
+    QAction* watchRegistrationAction = watchMenu->addAction(
+        kernelText("kernel.callback.enum.menu.hvm_watch.registration_write",
+                   QStringLiteral("写入这条回调的注册记录")));
+    watchMenu->setEnabled(callbackRoutineAddress != 0ULL);
+    watchRoutineWriteAction->setEnabled(callbackRoutineAddress != 0ULL);
+    watchRoutineExecuteAction->setEnabled(callbackRoutineAddress != 0ULL);
+    watchRegistrationAction->setEnabled(registrationLooksLikeKernelAddress);
+    watchRegistrationAction->setToolTip(registrationLooksLikeKernelAddress
+        ? kernelText("kernel.callback.enum.menu.hvm_watch.registration_write.tip",
+                     QStringLiteral("监视注册结构所在的那一页，等下一次有人改它。"))
+        : kernelText("kernel.callback.enum.menu.hvm_watch.registration_write.unavailable",
+                     QStringLiteral("这种注册方式回报的是序号而不是地址，没有可监视的注册记录地址。")));
+    contextMenu.addSeparator();
+
     QMenu* copyMenu = contextMenu.addMenu(
         QIcon(":/Icon/process_copy_row.svg"),
         kernelText("kernel.context.menu.copy", QStringLiteral("复制")));
@@ -3062,6 +3109,48 @@ void KernelDock::showCallbackEnumContextMenu(const QPoint& localPosition)
     }
     if (selectedAction == uploadVirusTotalAction)
     {
+        return;
+    }
+
+    if (selectedAction == watchRoutineWriteAction ||
+        selectedAction == watchRoutineExecuteAction ||
+        selectedAction == watchRegistrationAction)
+    {
+        ks::ui::HvmWatchRequest request;
+        request.virtualAddress = true;
+        if (selectedAction == watchRegistrationAction)
+        {
+            request.address = callbackRegistrationAddress;
+            // 注册结构的大小随注册类型而变，这里不猜，按整页请求。
+            request.length = 0ULL;
+            request.access = KSWORD_ARK_HVM_EPT_ACCESS_WRITE;
+        }
+        else
+        {
+            request.address = callbackRoutineAddress;
+            /*
+             * 首部 16 字节。inline hook 改的就是这几个字节（jmp rel32 是 5 字节，
+             * mov rax,imm64 + jmp rax 是 12 字节），比整页窄，命中后的"落在请求
+             * 范围内"才有区分力。硬件仍然盯的是整页，这一点两栏并排显示。
+             */
+            request.length = 16ULL;
+            request.access = selectedAction == watchRoutineExecuteAction
+                ? KSWORD_ARK_HVM_EPT_ACCESS_EXECUTE
+                : KSWORD_ARK_HVM_EPT_ACCESS_WRITE;
+        }
+        request.label = kernelText(
+            "kernel.callback.enum.menu.hvm_watch.label",
+            QStringLiteral("内核回调 %1（%2）"))
+            .arg(actionEntry != nullptr && !actionEntry->nameText.isEmpty()
+                ? actionEntry->nameText
+                : kernelText("kernel.callback.enum.placeholder.unknown_callback",
+                             QStringLiteral("<未知回调>")))
+            .arg(selectedAction == watchRegistrationAction
+                ? kernelText("kernel.callback.enum.menu.hvm_watch.label.registration",
+                             QStringLiteral("注册记录"))
+                : kernelText("kernel.callback.enum.menu.hvm_watch.label.routine",
+                             QStringLiteral("例程首部")));
+        ks::ui::openHvmWatch(this, request);
         return;
     }
 

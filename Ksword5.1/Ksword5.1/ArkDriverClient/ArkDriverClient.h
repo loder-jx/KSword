@@ -508,6 +508,36 @@ namespace ksword::ark
             // enforce：持久拒绝（命中注入 #PF 并继续常驻），与 allowOnce 互斥；
             // 驱动侧在存储规则时会丢弃同时给出的 allowOnce。
             bool enforce = false) const;
+
+        // HvmEptWatchRequest：一次 R-1 首次访问归因（Memory Watch）操作。
+        //
+        // 与 controlHvmEptRule 分开而不是再加六个形参：watch 用的是同一条
+        // IOCTL 和同一张规则表（处置语义是新增的 WATCH_ONCE 标志），但它的输入
+        // 是另一组——用户请求的地址与长度、地址种类——而那三项对其余处置一律
+        // 无意义。挤进同一个十参数函数里，每个调用点都要为自己用不到的参数写
+        // 一串零，而"哪个零是哪一项"正是最容易写错又最难看出来的地方。
+        struct HvmEptWatchRequest
+        {
+            // KSWORD_ARK_HVM_EPT_RULE_ADD / _REARM / _REMOVE / _WATCH_QUERY。
+            unsigned long operation = 0;
+            unsigned long expectedGeneration = 0;
+            // REARM / REMOVE 用；ADD 时由驱动分配并回填。
+            unsigned long watchId = 0;
+            // 用户勾选的访问类型，未经架构归一化。
+            unsigned long requestedAccess = 0;
+            // KSWORD_ARK_HVM_WATCH_ADDRESS_*，仅作回显。
+            unsigned long addressKind = 0;
+            // 实际监视的 4 KiB 物理页，必须页对齐。
+            std::uint64_t physicalPage = 0;
+            // 用户真正关心的那一段，用来判断命中是否落在范围内。
+            std::uint64_t requestedAddress = 0;
+            std::uint64_t requestedLength = 0;
+        };
+
+        // controlHvmEptWatch：执行一次 watch 操作。
+        // 查询不需要确认令牌；其余操作一律带上，与规则路径同一道门。
+        HvmEptRuleResult controlHvmEptWatch(
+            const HvmEptWatchRequest& request) const;
         // controlHvmCrPolicy：配置、清除或查询控制寄存器策略。
         // 掩码与 CR3/DR 拦截开关都在建 VMCS 时消费，所以必须在常驻启动前设置。
         HvmCrPolicyResult controlHvmCrPolicy(
@@ -570,6 +600,17 @@ namespace ksword::ark
             unsigned long processId,
             std::uint64_t guestLinearAddress,
             bool uiConfirmed) const;
+        // resolveHvmDirectoryBase：把一个观测到的 CR3 归到一个 PID 上。
+        // - 唯一的来源是内存监视命中现场里的 guestCr3，界面靠它把"哪个地址
+        //   空间"翻译成"哪个进程"；
+        // - 判据是驱动 attach 进去读回来的那个寄存器值，用户态问不出来，所以
+        //   这件事只能在 R0 做；
+        // - 结果必然是 best-effort：PID 会被回收、地址空间会在命中与查询之间
+        //   消失、内核工作线程借别人的地址空间跑、KVA Shadow 下用户态与内核态
+        //   用的不是同一个 CR3。响应里的 resolvedScannedProcesses 把"扫过都不是
+        //   它"与"一个都没扫成"分开，界面必须照着这两种分别措辞。
+        HvmProcessResult resolveHvmDirectoryBase(
+            std::uint64_t directoryBase) const;
         // controlHvmInject：R-1 层的进程注入——分离视图 + 线程劫持。
         // - 与 R0 注入（ZwAllocateVirtualMemory + ZwCreateThreadEx）是两条不同的
         //   通路：这一条一个内核 API 都不调，目标里也不会多出线程或内存区域；

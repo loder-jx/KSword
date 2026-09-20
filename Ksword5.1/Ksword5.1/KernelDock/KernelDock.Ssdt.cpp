@@ -8,6 +8,8 @@
 #include "../ArkDriverClient/ArkDriverClient.h"
 #include "../UI/CodeEditorWidget.h"
 #include "../UI/DetailLayoutRegistry.h"
+/* 统一入口：这一页不需要知道 GPA、EPT 叶或 ruleId。 */
+#include "../UI/KvmWatchDialog.h"
 #include "../theme.h"
 
 #include <QAbstractItemView>
@@ -265,7 +267,41 @@ void KernelDock::initializeSsdtTab()
             kernelText("kernel.ssdt.menu.copy_row", QStringLiteral("复制当前行")));
         copyRowAction->setEnabled(currentRow >= 0);
 
+        /*
+         * 监视这一项**槽位本身**的写入，不是它指向的服务例程。
+         *
+         * 改 SSDT 就是改槽位里那个编码值；例程被改是另一回事（那是 inline hook，
+         * 该去反汇编页盯）。监视错了对象的后果不是报错，是永远等不到命中。
+         */
+        const KernelSsdtEntry* const watchEntry = currentSsdtEntry();
+        QAction* watchAction = contextMenu.addAction(
+            kernelText("kernel.ssdt.menu.hvm_watch",
+                       QStringLiteral("HVM 监视：下一次写入这一槽位")));
+        watchAction->setEnabled(
+            watchEntry != nullptr && watchEntry->tableEntryAddress != 0U);
+        watchAction->setToolTip(kernelText(
+            "kernel.ssdt.menu.hvm_watch.tip",
+            QStringLiteral("装一条首次访问监视，等下一次有人写这一槽位时记下访问者的 RIP、模块与地址空间。命中不阻止写入，也不会让常驻退出。")));
+
         QAction* selectedAction = contextMenu.exec(m_ssdtTable->viewport()->mapToGlobal(localPosition));
+        if (selectedAction == watchAction && watchEntry != nullptr)
+        {
+            ks::ui::HvmWatchRequest request;
+            request.virtualAddress = true;
+            request.address = watchEntry->tableEntryAddress;
+            // 槽宽由驱动回报（x64 上是 4 字节的编码偏移），不要写死。
+            request.length = watchEntry->tableEntrySize != 0U
+                ? watchEntry->tableEntrySize
+                : sizeof(std::uint32_t);
+            request.access = KSWORD_ARK_HVM_EPT_ACCESS_WRITE;
+            request.label = kernelText(
+                "kernel.ssdt.menu.hvm_watch.label",
+                QStringLiteral("SSDT 槽位 #%1 %2"))
+                .arg(watchEntry->serviceIndex)
+                .arg(watchEntry->serviceNameText);
+            ks::ui::openHvmWatch(this, request);
+            return;
+        }
         if (selectedAction != copyRowAction || currentRow < 0)
         {
             return;

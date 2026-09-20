@@ -310,18 +310,6 @@ void KernelHvmTab::initializeUi()
     toolbar->addWidget(m_stopResidentButton);
     toolbar->addWidget(m_teardownButton);
     toolbar->addWidget(m_featureActionButton);
-    auto* commandsButton = new QPushButton(ks::i18n::sourceText(QStringLiteral("KVM 完整命令面板")), this);
-    toolbar->addWidget(commandsButton);
-    connect(commandsButton, &QPushButton::clicked, this, [this]() {
-        for (auto* widget : QApplication::topLevelWidgets())
-        {
-            if (auto* mainWindow = qobject_cast<MainWindow*>(widget))
-            {
-                mainWindow->focusKvmCommands();
-                return;
-            }
-        }
-    });
     rootLayout->addLayout(toolbar);
     // 状态标签移出按钮行：换行布局没有 stretch，跟在最后一个按钮后面会被
     // 当成第九个"按钮"参与折行，位置随窗口宽度乱跳。自己占一行反而稳定。
@@ -557,9 +545,23 @@ void KernelHvmTab::applyStatus(ksword::ark::HvmStatusResult result)
             .arg(nestedStateText(m_snapshot.nestedState))
             .arg(m_snapshot.nestedL2LaunchRefusedCount));
 
-    // AMD uses a separate summary so Intel EPT/nested counters are not presented as AMD evidence.
+    // AMD 用自己的摘要，免得把 Intel 的 EPT 与嵌套计数当成 AMD 的证据摆出来。
+    //
+    // 摘要是一条横幅，不是详情：原先这里整块塞的是 buildDetail 的七行输出，
+    // 而下面的 m_detailEdit 显示的就是同一个 buildDetail —— 同样的内容在一页上
+    // 出现两次，其中一次还把横幅撑成七行。这里只留一行，并指向详情框。
     if (m_snapshot.backend == KSWORD_ARK_HVM_BACKEND_SVM)
-        m_summaryLabel->setText(buildDetail(m_snapshot));
+    {
+        m_summaryLabel->setText(kernelText(
+            "kernel.hvm.summary.amd",
+            QStringLiteral("AMD SVM / VMCB / NPT（实验性）　准备 / 自检 / 常驻：%1 / %2 / %3　NPT 就绪：%4\n完整读数见下方详情；内层 SVM 与 EPT 扩展未实现。"))
+            .arg(m_snapshot.preparedProcessorCount)
+            .arg(m_snapshot.selfTestPassedProcessorCount)
+            .arg(m_snapshot.residentProcessorCount)
+            .arg(m_snapshot.slatReady
+                ? kernelText("kernel.hvm.yes_plain", QStringLiteral("是"))
+                : kernelText("kernel.hvm.no_plain", QStringLiteral("否"))));
+    }
 
     const int rowCount = static_cast<int>(std::min<unsigned long>(
         m_snapshot.processorCount,
@@ -627,16 +629,27 @@ void KernelHvmTab::applyStatus(ksword::ark::HvmStatusResult result)
         m_cpuTable->setItem(
             rowIndex,
             CpuColumnGuestExit,
+            // AMD 下这一列是 VMCB 的退出码，但它只有在真的退出过之后才有意义：
+            // 没跑过 VMRUN 时字段是零，而零是一个合法的退出码（#DE）。原先无条件
+            // 把它显示成 0x0000000000000000，等于把一个从没采集过的值摆成硬件读数。
             readOnlyItem(cpu.backend == KSWORD_ARK_HVM_BACKEND_SVM
-                ? QStringLiteral("0x%1").arg(cpu.svmExitCode, 16, 16, QLatin1Char('0')) : guestExitText));
+                ? (cpu.vmExitCount == 0ULL
+                       ? QStringLiteral("-")
+                       : QStringLiteral("0x%1")
+                             .arg(cpu.svmExitCode, 16, 16, QLatin1Char('0')))
+                : guestExitText));
         m_cpuTable->setItem(
             rowIndex,
             CpuColumnVmxResult,
+            // 这一列的表头是「执行状态」。Intel 侧放的是 VM-instruction error，
+            // AMD 侧放的是执行阶段——两者都是"这一步走到哪儿/错在哪儿"，同一列成立。
+            // 但阶段必须译成名字：一个裸的 3 在这张表里读不出任何东西。
             readOnlyItem(
-                cpu.backend == KSWORD_ARK_HVM_BACKEND_SVM ? QString::number(cpu.executionStage) :
-                cpu.vmxInstructionResult == 0xFFU
-                    ? QStringLiteral("-")
-                    : QString::number(cpu.vmxInstructionResult)));
+                cpu.backend == KSWORD_ARK_HVM_BACKEND_SVM
+                    ? executionStageText(cpu.executionStage)
+                    : cpu.vmxInstructionResult == 0xFFU
+                        ? QStringLiteral("-")
+                        : QString::number(cpu.vmxInstructionResult)));
         m_cpuTable->setItem(
             rowIndex,
             CpuColumnNtStatus,
@@ -1239,17 +1252,64 @@ void KernelHvmTab::updateButtons()
     }());
     if (amd)
     {
-        m_prepareButton->setText(QStringLiteral("SVM / VMCB / NPT"));
+        // 按钮文案不换。原先这里把「准备资源」改写成 "SVM / VMCB / NPT"，
+        // 那是把一个动作名替换成了一个架构名：按钮不再说明自己做什么，而后端
+        // 是什么在页面顶部的状态里已经写着。
         m_launchButton->setEnabled(false);
         m_featureActionButton->setEnabled(false);
-        // Intel-specific menu preferences are not silently applied to AMD.
-        if (ksword::kvm::isLocalEptEnabled() || ksword::kvm::isEptpSwitchEnabled() ||
-            ksword::kvm::isNestedDispatchEnabled() || ksword::kvm::isVeEnabled() ||
-            ksword::kvm::isVmFuncEnabled() || ksword::kvm::isHypervisorHidden())
+        const QString amdFeatureReason = kernelText(
+            "kernel.hvm.gate.amd_intel_only",
+            QStringLiteral("灰掉的原因：这一项建立在 Intel VMX 的 VMCS 字段或 EPT 分离视图上，当前的 AMD SVM/NPT 后端还没有对应实现。"));
+        setGateTooltip(m_launchButton, amdFeatureReason);
+        setGateTooltip(m_featureActionButton, amdFeatureReason);
+
+        // Intel 专属开关不会被悄悄套用到 AMD 上。
+        //
+        // 灰掉两个按钮并逐条点名是哪些开关：这几个开关全都持久化或跨会话保留，
+        // 用户很可能是在另一台 Intel 机器上打开的，到这里只看到两个灰按钮而
+        // 完全不知道该去哪儿关。原先这里没有任何说明，那就是一条死路。
+        QStringList blockingOptions;
+        if (ksword::kvm::isLocalEptEnabled())
         {
+            blockingOptions << kernelText("kernel.hvm.option.local_ept",
+                QStringLiteral("每处理器私有 EPT"));
+        }
+        if (ksword::kvm::isEptpSwitchEnabled())
+        {
+            blockingOptions << kernelText("kernel.hvm.option.eptp_switch",
+                QStringLiteral("EPTP 切换后端"));
+        }
+        if (ksword::kvm::isNestedDispatchEnabled())
+        {
+            blockingOptions << kernelText("kernel.hvm.option.nested_dispatch",
+                QStringLiteral("嵌套 VMX 派发"));
+        }
+        if (ksword::kvm::isVeEnabled())
+        {
+            blockingOptions << kernelText("kernel.hvm.option.ve",
+                QStringLiteral("#VE 反射"));
+        }
+        if (ksword::kvm::isVmFuncEnabled())
+        {
+            blockingOptions << kernelText("kernel.hvm.option.vmfunc",
+                QStringLiteral("VMFUNC"));
+        }
+        if (ksword::kvm::isHypervisorHidden())
+        {
+            blockingOptions << kernelText("kernel.hvm.option.hide_hypervisor",
+                QStringLiteral("隐藏 Hypervisor 身份"));
+        }
+        if (!blockingOptions.isEmpty())
+        {
+            const QString optionReason = kernelText(
+                "kernel.hvm.gate.amd_intel_options",
+                QStringLiteral("灰掉的原因：以下 Intel 专属选项当前是打开的，AMD 后端不接受它们：%1。请在标题栏 KVM 按钮的右键菜单里关掉后重试。"))
+                .arg(blockingOptions.join(
+                    kernelText("kernel.hvm.option.separator", QStringLiteral("、"))));
             m_prepareButton->setEnabled(false);
             m_startResidentButton->setEnabled(false);
+            setGateTooltip(m_prepareButton, optionReason);
+            setGateTooltip(m_startResidentButton, optionReason);
         }
     }
-
 }

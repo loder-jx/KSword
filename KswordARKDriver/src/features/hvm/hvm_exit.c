@@ -514,6 +514,145 @@ KswordARKHvmExitPublishTelemetry(
 }
 
 /*
+ * Publish one first-touch watch hit and record what happened to the evidence.
+ *
+ * Separate from KswordARKHvmExitPublishTelemetry on purpose.  That function is
+ * the routine path every exit takes; it maintains counters and the lastExit*
+ * fields and is gated by the routine-trace switch.  A watch hit is a one-off
+ * evidence row that must never be gated, must carry three extra registers, and
+ * must report back whether the ring took it.  Folding those requirements into
+ * the hot path would make every exit pay for a case that happens once.
+ *
+ * Everything recorded here is read in VMX root because it cannot be read
+ * anywhere else: RSP and CR3 stop describing the faulting context the moment
+ * the guest resumes.  Nothing Windows-aware happens here - no process lookup,
+ * no module resolution, no stack walk.  Those need a real context and pageable
+ * data, and doing them in VMX root risks the whole machine to save a round
+ * trip.  The ring carries facts; the layers above turn them into names.
+ */
+static VOID
+KswordARKHvmExitPublishWatchHit(
+    _Inout_ KSW_HVM_RESIDENT_VCPU* Context,
+    _In_ const KSW_HVM_VMEXIT_TELEMETRY* Telemetry,
+    _In_ ULONGLONG GuestPhysicalAddress,
+    _In_ ULONGLONG GuestLinearAddress,
+    _In_ ULONG Access,
+    _In_ const KSW_HVM_EPT_WATCH_HIT* WatchHit,
+    _In_ BOOLEAN GuestLinearValid
+    )
+{
+    KSWORD_ARK_HVM_EVENT_ROW eventRow = { 0 };
+    KSW_HVM_EPT_RULE_SLOT* slot = NULL;
+    SIZE_T guestCr3 = 0U;
+    ULONGLONG publishedSequence = 0ULL;
+    ULONG index = 0UL;
+
+    /* Reject incomplete fixed state without publishing partial evidence. */
+    if (Context == NULL ||
+        Context->Runtime == NULL ||
+        Context->Resource == NULL ||
+        Telemetry == NULL ||
+        WatchHit == NULL) {
+        /* Return without publishing anything. */
+        return;
+    }
+    /* Locate the watch record this hit belongs to. */
+    for (index = 0UL;
+         index < KSWORD_ARK_HVM_MAX_EPT_RULES;
+         ++index) {
+        KSW_HVM_EPT_RULE_SLOT* rule =
+            &Context->Runtime->EptRules[index];
+
+        /* Select the active watch carrying this identifier. */
+        if (rule->Active &&
+            rule->RuleId == WatchHit->WatchId &&
+            (rule->Flags &
+                KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE) != 0UL) {
+            /* Preserve the record that receives the hit scene. */
+            slot = rule;
+            /* Stop after the one matching bounded record. */
+            break;
+        }
+    }
+    /*
+     * CR3 is best effort: the outer hypervisor is known to refuse some guest
+     * state encodings, and a refused read must leave the field zero rather
+     * than a plausible wrong value.  Zero reads as "unavailable" upstream.
+     */
+    if (KswordARKHvmVmcsFieldLoad(
+            KSW_VMCS_GUEST_CR3,
+            &guestCr3) != 0U) {
+        /* Preserve the unavailable marker rather than inventing a value. */
+        guestCr3 = 0U;
+    }
+    /* Preserve the exact processor identity. */
+    eventRow.processorGroup = Context->Resource->Row.processorGroup;
+    eventRow.processorNumber = Context->Resource->Row.processorNumber;
+    /* Classify the row as an EPT violation carrying a watch hit. */
+    eventRow.type = KSWORD_ARK_HVM_EVENT_TYPE_EPT_VIOLATION;
+    eventRow.exitReason =
+        Telemetry->Reason & KSW_HVM_VMEXIT_REASON_BASIC_MASK;
+    eventRow.access = Access;
+    eventRow.ruleId = WatchHit->WatchId;
+    eventRow.guestPhysicalAddress = GuestPhysicalAddress;
+    eventRow.guestLinearAddress = GuestLinearAddress;
+    eventRow.guestRip = Telemetry->GuestRip;
+    eventRow.qualification = Telemetry->Qualification;
+    eventRow.status = STATUS_SUCCESS;
+    /* Preserve the registers that only exist at the faulting instant. */
+    eventRow.guestRsp = Telemetry->GuestRsp;
+    eventRow.guestCr3 = (ULONGLONG)guestCr3;
+    eventRow.watchState = KSWORD_ARK_HVM_EPT_WATCH_STATE_DISARMED;
+    /* Preserve what the hardware could and could not tell us about the access. */
+    eventRow.eventFlags = KSWORD_ARK_HVM_EVENT_FLAG_WATCH_HIT;
+    if (GuestLinearValid) {
+        /* Publish that the guest-linear address is meaningful. */
+        eventRow.eventFlags |= KSWORD_ARK_HVM_EVENT_FLAG_GLA_VALID;
+    }
+    if (WatchHit->RangeMatch) {
+        /* Publish that the access landed inside the requested bytes. */
+        eventRow.eventFlags |= KSWORD_ARK_HVM_EVENT_FLAG_RANGE_MATCH;
+    }
+    /* Publish the row and learn whether the ring kept it. */
+    if (KswordARKHvmEventPublishTracked(
+            &eventRow,
+            &publishedSequence)) {
+        /* Record the sequence a reader can use to find this exact row. */
+        if (slot != NULL) {
+            /* Publish the located evidence. */
+            slot->WatchLastHitSequence = publishedSequence;
+            slot->WatchLastHitStatus =
+                KSWORD_ARK_HVM_EPT_WATCH_HIT_PUBLISHED;
+        }
+    }
+    /* Record the rest of the scene on the watch itself. */
+    if (slot != NULL) {
+        /*
+         * The watch keeps its own copy of the scene because the ring wraps.
+         * Once it does, an event-only record would turn a real observation
+         * back into "nothing was seen", which is the one answer this feature
+         * must never give wrongly.
+         */
+        slot->WatchLastHitRip = Telemetry->GuestRip;
+        slot->WatchLastHitRsp = Telemetry->GuestRsp;
+        slot->WatchLastHitCr3 = (ULONGLONG)guestCr3;
+        slot->WatchLastHitTimestamp =
+            (ULONGLONG)KeQueryPerformanceCounter(NULL).QuadPart;
+        slot->WatchLastHitProcessorGroup =
+            Context->Resource->Row.processorGroup;
+        slot->WatchLastHitProcessorNumber =
+            Context->Resource->Row.processorNumber;
+    }
+    /* Publish protocol-visible event availability. */
+    if ((ReadAcquire((volatile LONG*)&Context->Runtime->StateFlags) &
+        KSWORD_ARK_HVM_STATE_EVENTS_AVAILABLE) == 0UL) {
+        /* Lifecycle clears this flag only after exits have stopped. */
+        InterlockedOr((volatile LONG*)&Context->Runtime->StateFlags,
+            (LONG)KSWORD_ARK_HVM_STATE_EVENTS_AVAILABLE);
+    }
+}
+
+/*
  * Report the privilege level the guest executed the current instruction at.
  *
  * VMCALL exits before the processor performs any privilege check: SDM orders
@@ -2106,6 +2245,7 @@ KswordARKHvmResidentVmExitDispatchBody(
     KSW_HVM_EPT_VIEW_SWITCH viewSwitch = { 0 };
     NTSTATUS status = STATUS_SUCCESS;
     ULONG eptDisposition = KSW_HVM_EPT_DISPOSITION_DEVIRTUALIZE;
+    KSW_HVM_EPT_WATCH_HIT watchHit = { 0 };
     BOOLEAN handled = FALSE;
     BOOLEAN injectFault = FALSE;
     BOOLEAN guestLinearValid = FALSE;
@@ -3032,14 +3172,42 @@ KswordARKHvmResidentVmExitDispatchBody(
             : KswordARKHvmEptHandleViolation(
                 Context->Runtime,
                 guestPhysicalAddress,
+                guestLinearAddress,
                 access,
                 guestLinearValid,
                 Context->EptLocal,
                 &Context->EptTransient,
                 &ruleId,
-                &eptDisposition);
+                &eptDisposition,
+                &watchHit);
         /* Complete the disposition the rule aggregation selected. */
         if (handled) {
+            if (eptDisposition ==
+                KSW_HVM_EPT_DISPOSITION_WATCH_ONCE) {
+                /*
+                 * First-touch watch: the page is already unrestricted again
+                 * and the hierarchy invalidated.  Nothing is armed and
+                 * nothing is denied, so the only thing left is to resume with
+                 * RIP untouched and let the original instruction re-execute.
+                 *
+                 * The evidence goes out here rather than inside the rule
+                 * handler because publishing needs the exit telemetry - RIP,
+                 * RSP and the qualification - which only this frame has.
+                 */
+                if (watchHit.FirstHit) {
+                    /* Publish one first-touch record for this watch. */
+                    KswordARKHvmExitPublishWatchHit(
+                        Context,
+                        &telemetry,
+                        guestPhysicalAddress,
+                        guestLinearAddress,
+                        access,
+                        &watchHit,
+                        guestLinearValid);
+                }
+                /* Resume the guest so the watched access completes normally. */
+                return KSW_HVM_EXIT_ACTION_RESUME;
+            }
             if (eptDisposition ==
                 KSW_HVM_EPT_DISPOSITION_INJECT_FAULT) {
                 /*

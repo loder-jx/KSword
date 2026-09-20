@@ -47,9 +47,9 @@ static BOOL WINAPI FakeDeviceIoControl(HANDLE device, DWORD code, LPVOID input,
     return TRUE;
 }
 
-#include "../../Ksword5.1/Ksword5.1/ArkDriverClient/HvmCommandCatalog.c"
+#include "HvmCommandCatalog.c"
 #define DeviceIoControl FakeDeviceIoControl
-#include "../../Ksword5.1/Ksword5.1/ArkDriverClient/HvmCommandEngine.c"
+#include "HvmCommandEngine.c"
 #undef DeviceIoControl
 
 int main(int argc, char** argv)

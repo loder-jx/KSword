@@ -2,6 +2,8 @@
 #include "../UI/TableInteractionSupport.h"
 #include "../UI/VisibleTableWidget.h"
 #include "../UI/DetailLayoutRegistry.h"
+/* 统一入口：这一页不需要知道 GPA、EPT 叶或 ruleId。 */
+#include "../UI/KvmWatchDialog.h"
 
 #include <QColor>      // QColor：风险行前景色着色使用。
 #include <QPixmap>
@@ -292,13 +294,51 @@ namespace
                 QIcon(QStringLiteral(":/Icon/process_copy_row.svg")),
                 QStringLiteral("复制当前行"));
             copyRowAction->setEnabled(rowIndex >= 0 && rowIndex < table->rowCount());
-            if (menu.exec(table->viewport()->mapToGlobal(localPosition)) == copyRowAction)
+
+            /*
+             * 三种访问各给一项，而不是一个"监视"再弹二级菜单。
+             *
+             * 选哪一种不是偏好，是在问不同的问题：写=谁改它，执行=谁跑它，
+             * 读=谁在扫它。把三者折进一个入口，用户就得先想明白自己要问什么
+             * 才点得下去，而这一页的读者往往正是还不确定的那个人。
+             */
+            const quint64 rowAddress = (rowIndex >= 0 && table->item(rowIndex, 0) != nullptr)
+                ? table->item(rowIndex, 0)->data(Qt::UserRole).toULongLong()
+                : 0ULL;
+            menu.addSeparator();
+            QMenu* const watchMenu = menu.addMenu(QStringLiteral("HVM 监视这一页的下一次访问"));
+            watchMenu->setStyleSheet(kernelExecutableCopyMenuStyle());
+            QAction* const watchWrite = watchMenu->addAction(QStringLiteral("写入"));
+            QAction* const watchExecute = watchMenu->addAction(QStringLiteral("执行"));
+            QAction* const watchRead = watchMenu->addAction(QStringLiteral("读取"));
+            watchMenu->setEnabled(rowAddress != 0ULL);
+
+            QAction* const chosen = menu.exec(table->viewport()->mapToGlobal(localPosition));
+            if (chosen == copyRowAction)
             {
                 QClipboard* clipboard = QApplication::clipboard();
                 if (clipboard != nullptr)
                 {
                     clipboard->setText(kernelExecutableRowText(table, rowIndex));
                 }
+            }
+            else if (rowAddress != 0ULL &&
+                     (chosen == watchWrite || chosen == watchExecute || chosen == watchRead))
+            {
+                ks::ui::HvmWatchRequest request;
+                request.virtualAddress = true;
+                request.address = rowAddress;
+                // 这一页上选中的是一整块可执行区域，没有更细的"用户关心的
+                // 几个字节"可言，所以请求范围就是整页。
+                request.length = 0ULL;
+                request.access = chosen == watchWrite
+                    ? KSWORD_ARK_HVM_EPT_ACCESS_WRITE
+                    : chosen == watchExecute
+                        ? KSWORD_ARK_HVM_EPT_ACCESS_EXECUTE
+                        : KSWORD_ARK_HVM_EPT_ACCESS_READ;
+                request.label = QStringLiteral("可执行内核内存 %1")
+                    .arg(rowAddress, 16, 16, QLatin1Char('0'));
+                ks::ui::openHvmWatch(table, request);
             }
         });
     }

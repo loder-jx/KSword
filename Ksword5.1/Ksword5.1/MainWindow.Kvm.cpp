@@ -22,6 +22,7 @@
 #include "UI/KvmMsrPolicyDialog.h"
 #include "UI/KvmDomainDialog.h"
 #include "UI/KvmHookWizard.h"
+#include "UI/KvmProcessDialog.h"
 #include "UI/KvmViewDialog.h"
 #include "UI/KvmWriteAccessGate.h"
 #include "theme.h"
@@ -173,12 +174,6 @@ KvmDock* MainWindow::createKvmDockContent()
     return dockContent;
 }
 
-void MainWindow::focusKvmCommands()
-{
-    activateDockForSearchNavigation(m_dockKvm);
-    if (m_kvmWidget) { m_kvmWidget->showCommandPanel(); }
-}
-
 void MainWindow::handleKvmDockAction(const KvmDock::Action action)
 {
     // 这一层只做分派。每一条都落到右键菜单用的同一个实现上，包括那几处
@@ -211,9 +206,6 @@ void MainWindow::handleKvmDockAction(const KvmDock::Action action)
         // 所以这一条不走 showKvmDialog —— 走了会重复设置属性并多一层 show。
         ks::ui::KvmHookWizard::openWizard(this);
         return;
-    case KvmDock::Action::OpenCommandPanel:
-        focusKvmCommands();
-        return;
     case KvmDock::Action::OpenViewDialog:
         showKvmDialog(new KvmViewDialog(this));
         return;
@@ -231,6 +223,9 @@ void MainWindow::handleKvmDockAction(const KvmDock::Action action)
         return;
     case KvmDock::Action::OpenEventDialog:
         showKvmDialog(new KvmEventDialog(this));
+        return;
+    case KvmDock::Action::OpenProcessDialog:
+        showKvmDialog(new KvmProcessDialog(this));
         return;
     }
 }
@@ -310,6 +305,7 @@ void MainWindow::refreshKvmStatusAsync()
                     state.availability == ksword::kvm::KvmAvailability::NotPrepared;
                 safeThis->m_kvmFaulted = state.faulted;
                 safeThis->m_kvmGeneration = state.generation;
+                safeThis->m_kvmBackend = state.backend;
                 safeThis->m_kvmTooltip = state.detail;
                 safeThis->applyKvmButtonState();
             },
@@ -1040,6 +1036,18 @@ void MainWindow::showKvmMenu(const QPoint& globalPosition)
         dialog->show();
     });
 
+    // R-1 进程处置与注入。这一项此前只能经「完整命令面板」下达，而那条路是把
+    // 主程序当 hvm_ctl 子进程拉起来的探针通路，已整条摘除；能力本身有专属
+    // IOCTL，所以在这里补一个与其它面板同形状的入口。
+    QAction* const processAction = menu.addAction(
+        ks::i18n::sourceText(QStringLiteral("R-1 进程处置与注入...")));
+    processAction->setEnabled(m_r0DriverServiceRunning);
+    connect(processAction, &QAction::triggered, this, [this]() {
+        KvmProcessDialog* const dialog = new KvmProcessDialog(this);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->show();
+    });
+
     menu.addSeparator();
 
     // 故障重置只清可恢复标记，常驻中会被驱动拒绝。
@@ -1050,10 +1058,23 @@ void MainWindow::showKvmMenu(const QPoint& globalPosition)
         runKvmFaultReset();
     });
 
-    menu.addSeparator();
-    QAction* const commandsAction = menu.addAction(ks::i18n::sourceText(QStringLiteral("KVM 完整命令面板")));
-    connect(commandsAction, &QAction::triggered, this, [this]() {
-        handleKvmDockAction(KvmDock::Action::OpenCommandPanel);
-    });
+    // AMD 后端：把建立在 EPT 分离视图或 VMCS 字段上的入口灰掉。
+    //
+    // 与 KvmDock 上那组门同一个判据、同一句说明——这两处各判各的，用户会在一个
+    // 入口里按不动、在另一个入口里按了没反应。
+    //
+    // 上面那批开关**不跟着灰**：它们里有持久化的（私有 EPT、EPTP 切换），用户
+    // 很可能是在另一台 Intel 机器上打开的，而 AMD 下它们开着会挡住准备资源。
+    // 一起灰掉就把唯一的关闭入口也关上了，那是一条死路。
+    if (m_kvmBackend == KSWORD_ARK_HVM_BACKEND_SVM)
+    {
+        const QString amdReason = ks::i18n::sourceText(QStringLiteral("这一项建立在 Intel VMX 的 VMCS 字段或 EPT 分离视图上，当前的 AMD SVM/NPT 后端还没有对应实现。"));
+        for (QAction* const action : { viewAction, domainAction, msrAction, crAction, processAction })
+        {
+            action->setEnabled(false);
+            action->setToolTip(amdReason);
+        }
+    }
+
     menu.exec(globalPosition);
 }

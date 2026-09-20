@@ -8,7 +8,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include "../../../shared/driver/KswordArkHvmIoctl.h"
+#include "../../shared/driver/KswordArkHvmIoctl.h"
 
 static const HVM_COMMAND_SPEC g_commands[] = {
     { "prepare-svm-probe", "准备 AMD 嵌套探针", "生命周期", "预分配 AMD 有界嵌套自检资源；不开放内层虚拟机运行。", HvmControl, 0, KSWORD_ARK_HVM_CONTROL_PREPARE,
@@ -149,6 +149,34 @@ static const HVM_COMMAND_SPEC g_commands[] = {
     { "nested-page-map-test", "换页故障注入", "TinyCore 换页", "仅用于专用测试页：1 分配失败，2 提交前取消，3 提交后回滚，4 提交失效失败。", HvmPageMapTest, 0, 0UL, 0UL, 4,
       { { "EPT12 指针（十六进制）", HvmHex64, NULL }, { "来宾物理页（十六进制，4 KiB 对齐）", HvmPageAddress, NULL }, { "影子页填充值（00–FF）", HvmByte, NULL }, { "故障阶段（1–4）", HvmDecimal32, NULL } } },
     { "nested-page-remove-test", "撤销失效故障注入", "TinyCore 换页", "模拟撤销时失效失败，保留 retired 页；随后用正常撤销命令重试回收。", HvmPageRemoveTest, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-add-va", "监视内核虚拟地址", "内存监视", "对一个内核虚拟地址建立首次访问监视。地址在这一刻翻译成物理页并就此绑定，之后来宾把同一个虚拟地址重映射到别处也不会跟过去。实际监视单位恒为它所在的整个 4 KiB 物理页，不是给出的长度。", HvmWatchAddVa, 0, 0UL, 0UL, 3,
+      { { "内核虚拟地址（十六进制）", HvmHex64, NULL }, { "关心的长度（十进制字节，0 表示整页）", HvmDecimal32, "8" }, { "访问掩码（1=读 2=写 4=执行，可相加）", HvmHex32, "2" } } },
+    { "watch-add-pa", "监视物理页", "内存监视", "对一个物理地址所在的 4 KiB 页建立首次访问监视。不做翻译，地址按页对齐后使用。", HvmWatchAddPa, 0, 0UL, 0UL, 3,
+      { { "物理地址（十六进制）", HvmHex64, NULL }, { "关心的长度（十进制字节，0 表示整页）", HvmDecimal32, "0" }, { "访问掩码（1=读 2=写 4=执行，可相加）", HvmHex32, "2" } } },
+    { "watch-list", "列出内存监视", "内存监视", "读回整张监视表：状态、请求与实际访问类型、累计命中次数、最近一次命中的现场与事件序号。", HvmWatchList, 1, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-rearm", "重新武装内存监视", "内存监视", "让一条已命中或已失效的监视再等下一次访问，保留编号与累计命中次数。", HvmWatchRearm, 0, 0UL, 0UL, 1,
+      { { "监视编号（十进制）", HvmDecimal32, NULL } } },
+    { "watch-remove", "移除内存监视", "内存监视", "撤销一条监视并恢复该页权限。", HvmWatchRemove, 0, 0UL, 0UL, 1,
+      { { "监视编号（十进制）", HvmDecimal32, NULL } } },
+    { "watch-selftest", "内存监视端到端自检（写）", "内存监视", "在本进程里分配并锁住一页，装一条写监视，写它，再逐项核对命中现场：命中一次、自动解除、原写最终生效、第二次写不再命中、常驻处理器数不变。常驻没在跑或装不上时记 BLOCKED 而不是 FAIL。", HvmWatchSelfTest, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-read", "内存监视端到端自检（读）", "内存监视", "同写自检的流程，只把被监视的访问换成读。额外核对一条只有读才成立的判据：EPT 不允许可写而不可读，所以「只监视读」在硬件上必然连写也一起监视，实际访问掩码应当比请求的宽。", HvmWatchSelfTestRead, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-exec", "内存监视端到端自检（执行）", "内存监视", "同写自检的流程，只把被监视的访问换成执行：页按可执行分配并写入一条 ret，然后调用它。拒绝执行不需要 execute-only 能力（读写照留），所以掩码不该被放宽——放宽了就是缺陷而不是环境限制。", HvmWatchSelfTestExec, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-smp", "内存监视多核同时命中自检", "内存监视", "把每个可用处理器各绑一个线程，同时写同一个被监视页。要问的不是能不能命中，而是多核竞争下会不会各算一次第一次：命中数必须恰好是 1，每个线程的写都要落盘，处理器一个都不能掉出虚拟化。只有一个处理器或有多个处理器组时记 BLOCKED。", HvmWatchSelfTestSmp, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-remap", "内存监视 VA 重映射自检", "内存监视", "装完监视后把同一个虚拟地址解提交再提交，换到另一个物理页，然后证明监视**没有**跟过去：它仍报告原来那个物理页，写新映射也不产生命中。第一版不跟踪重映射是承诺而不是遗漏。内存管理器还回同一个页框时记 BLOCKED。", HvmWatchSelfTestRemap, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-evidence", "内存监视事件丢失自检", "内存监视", "开着例行退出追踪起常驻，让事件环快速回绕，把命中那一行挤出去，然后核对：事件查询取不回它了，但监视自己仍报得出命中过与现场。表里同时留一条从没被碰过的监视作对照——只有两者读数不同，「命中但证据丢了」与「从未命中」才算真的区分得开。", HvmWatchSelfTestEvidence, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-conflict", "内存监视视图冲突自检", "内存监视", "先把一页交给一条 CLOAK 分离视图，再让监视去要同一页。一页只能有一个主人：要证的是装不上、说得清是谁占着、以及原视图一根毫毛没动。第三条最要紧——顺手改了别人叶项的实现，从返回值上看与正确实现完全一样。这台机器装不上分离视图时记 BLOCKED。安装视图要 EPTP 切换后端，而后端是在 prepare 那一刻定的，所以这条自检**会先 teardown**：运行时里现有的监视与视图都会被清掉。", HvmWatchSelfTestConflict, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-process", "内存监视进程归因自检", "内存监视", "在自己身上装一条写监视、命中它，然后把现场记下的 CR3 送回驱动反查 PID。判据是归出来的必须是本进程——归不出来是一条限制（用户态命中在 KVA Shadow 下本就对不上内核 CR3），归到别的进程上才是假证据。另外拿一个不可能存在的地址空间去问，必须干净地答没有。", HvmWatchSelfTestProcess, 0, 0UL, 0UL, 0,
+      { { NULL, HvmDecimal32, NULL } } },
+    { "watch-selftest-restart", "内存监视常驻重启自检", "内存监视", "装一条监视，起常驻再停，核对它被标成已失效；重新起常驻后不会自己变回武装状态，写它也不再命中；显式重新武装之后才回到武装状态，并且换了一个新的武装代次。要防的是旧监视在下一次常驻里悄悄继续改 EPT 叶项，而那时它盯的页可能已经被回收给别人了。", HvmWatchSelfTestRestart, 0, 0UL, 0UL, 0,
       { { NULL, HvmDecimal32, NULL } } },
     { "msr-log", "记录指定 MSR", "寄存器策略", "添加指定 MSR 的日志策略；编号为十六进制。", HvmMsrLog, 0, 0UL, 0UL, 1,
       { { "MSR 编号（十六进制）", HvmHex32, "10" } } },

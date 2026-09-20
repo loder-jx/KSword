@@ -227,13 +227,16 @@ void KvmGuestVmPanel::showEvent(QShowEvent* event)
 void KvmGuestVmPanel::setBusy(const bool busy)
 {
     m_busy = busy;
-    if (m_doAll != nullptr) { m_doAll->setEnabled(!busy); }
+    // 「刷新」不看后端：读一次状态在哪台机器上都成立，而它正是用户在 AMD 上
+    // 唯一还能按的东西——把它一起灰掉，这一页就没有任何出口了。
     if (m_refresh != nullptr) { m_refresh->setEnabled(!busy); }
+    const bool actionsEnabled = !busy && m_backendSupported;
+    if (m_doAll != nullptr) { m_doAll->setEnabled(actionsEnabled); }
     for (StepRow* const row : { &m_stepAllowNested, &m_stepHostGuests,
                                 &m_stepHideIdentity, &m_stepStartMonitor,
                                 &m_stepRestartVmware })
     {
-        if (row->action != nullptr) { row->action->setEnabled(!busy); }
+        if (row->action != nullptr) { row->action->setEnabled(actionsEnabled); }
     }
     if (onBusyChanged) { onBusyChanged(busy); }
 }
@@ -330,6 +333,31 @@ void KvmGuestVmPanel::restartVmwareDriver()
 
 void KvmGuestVmPanel::applyState(const ksword::kvm::KvmState& state)
 {
+    // 后端判据先算：下面五步全都建立在 Intel 的嵌套 VMX 派发上。
+    // setBusy 不改忙碌位，只是拿新的 m_backendSupported 把按钮重刷一遍。
+    m_backendSupported = state.backend == KSWORD_ARK_HVM_BACKEND_VMX;
+    setBusy(m_busy);
+    if (!m_backendSupported)
+    {
+        // 五步全部标成"不适用"而不是"待办"：待办意味着按一下就能推进，
+        // 而这里按下去什么都不会发生——那是这一页最容易骗到人的一种显示。
+        const QString reason = state.backend == KSWORD_ARK_HVM_BACKEND_SVM
+            ? ks::i18n::sourceText(QStringLiteral("这一页只对 Intel 嵌套 VMX 成立。当前是 AMD SVM/NPT 后端：它不提供把第三方虚拟机跑在 KSwordVM 之下的能力，上面五步在这里按下去不会有任何效果。"))
+            : ks::i18n::sourceText(QStringLiteral("还读不到虚拟化后端。请先用标题栏的 R0 按钮启动 KswordARK 驱动服务，再回到这一页。"));
+        for (StepRow* const row : { &m_stepAllowNested, &m_stepHostGuests,
+                                    &m_stepHideIdentity, &m_stepStartMonitor,
+                                    &m_stepRestartVmware })
+        {
+            paintStatus(row->status,
+                        ks::i18n::sourceText(QStringLiteral("不适用")), false);
+        }
+        if (m_verdict != nullptr)
+        {
+            m_verdict->setText(reason);
+            m_verdict->setStyleSheet(QStringLiteral("font-weight:600;"));
+        }
+        return;
+    }
     const bool allowNested = ksword::kvm::isNestedAllowed();
     const bool hostGuests = ksword::kvm::isNestedDispatchEnabled();
     const bool hideIdentity = ksword::kvm::isHypervisorHidden();

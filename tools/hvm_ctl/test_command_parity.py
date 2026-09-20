@@ -1,4 +1,10 @@
-"""Check the actual CLI parser and GUI form report without mutating a driver."""
+"""Check the actual CLI parser without mutating a driver.
+
+2026-09-19：这里原先还断言每条命令的文案在 GUI 语言包里有对应词条。那条断言
+的前提是命令目录被主程序消费，而主程序对 hvm_ctl 的依赖已经整条摘掉——目录
+和引擎现在只属于这个探针，它的文案不该再出现在发布物的语言包里。保留下来的
+是 CLI 解析器本身的回归：进制、参数位置、位宽与页对齐。
+"""
 import argparse
 import json
 from pathlib import Path
@@ -18,12 +24,11 @@ def main():
     catalog = json.loads(result.stdout)["commands"]
     by_name = {c["name"]: c for c in catalog}
     assert len(by_name) == len(catalog), "Duplicate command name"
-    for locale in ("zh-CN", "en-US"):
-        pack = json.loads(Path(f"Ksword5.1/Ksword5.1/languages/{locale}.json").read_text(encoding="utf-8-sig"))["source_translations"]
-        for command in catalog:
-            for source in [command["title"], command["group"], command["description"],
-                           *(a["name"] for a in command["arguments"])]:
-                assert source in pack and pack[source], (locale, source)
+    for command in catalog:
+        # 目录文案只需自洽：非空即可，不再与任何语言包比对。
+        for source in [command["title"], command["group"], command["description"],
+                       *(a["name"] for a in command["arguments"])]:
+            assert source, command["name"]
 
     # Contract regressions: --json must not shift CPU/MSR arguments; hex values
     # must not become decimal, and 64-bit addresses must not be truncated.
@@ -87,7 +92,7 @@ def main():
         assert result.returncode == 2, (command, result.returncode, result.stdout, result.stderr)
         assert "device-open-failed" not in result.stdout, command
 
-    print(f"CATALOG_TRANSLATIONS=PASS ({len(catalog)} commands, 2 languages)")
+    print(f"CATALOG_TEXTS=PASS ({len(catalog)} commands)")
     print(f"ARGUMENT_CONTRACTS=PASS ({len(cases) * 2} valid, {len(invalid)} refused)")
 
 

@@ -264,6 +264,83 @@ namespace ksword::ark
         return result;
     }
 
+    HvmEptRuleResult DriverClient::controlHvmEptWatch(
+        const HvmEptWatchRequest& watch) const
+    {
+        HvmEptRuleResult result{};
+        KSWORD_ARK_HVM_EPT_RULE_REQUEST request{};
+        const bool mutating =
+            watch.operation != KSWORD_ARK_HVM_EPT_RULE_WATCH_QUERY &&
+            watch.operation != KSWORD_ARK_HVM_EPT_RULE_QUERY;
+
+        request.version = KSWORD_ARK_HVM_PROTOCOL_VERSION;
+        request.size = sizeof(request);
+        request.operation = watch.operation;
+        request.expectedGeneration = watch.expectedGeneration;
+        /*
+         * 每种操作**只**填它自己那几个字段，其余一律留零。
+         *
+         * 驱动侧对 REMOVE / CLEAR / QUERY / REARM / WATCH_QUERY 都有"字段必须
+         * 为空"的契约：带了值就说明调用方把它当成了别的操作，整条请求被判
+         * STATUS_INVALID_PARAMETER。无条件填满看着更简单，代价是四种操作里有
+         * 三种恒定被拒，而用户看到的只有一个 win32=87。
+         */
+        if (watch.operation == KSWORD_ARK_HVM_EPT_RULE_ADD)
+        {
+            request.deniedAccess = watch.requestedAccess;
+            request.physicalAddress = watch.physicalPage;
+            /*
+             * 一条 watch 恒定覆盖一页。
+             *
+             * 页数不是调用方能选的：EPT 权限本来就是页粒度，多页的 watch 只是
+             * 几条独立的 watch 共用一个标识和一个命中计数，而那个计数答不出
+             * "被动的是哪一页"。驱动侧同样拒绝 pageCount != 1，这里写死是为了
+             * 让这条约束在客户端就成立，而不是靠一次失败的 IOCTL 才发现。
+             */
+            request.pageCount = 1ULL;
+            request.requestedAddress = watch.requestedAddress;
+            request.requestedLength = watch.requestedLength;
+            request.requestedAccess = watch.requestedAccess;
+            request.addressKind = watch.addressKind;
+            request.flags |= KSWORD_ARK_HVM_EPT_RULE_FLAG_WATCH_ONCE;
+        }
+        else if (watch.operation == KSWORD_ARK_HVM_EPT_RULE_REARM ||
+                 watch.operation == KSWORD_ARK_HVM_EPT_RULE_REMOVE)
+        {
+            /* 两者都只按编号找已有记录，其余字段来自安装时存下的那一份。 */
+            request.ruleId = watch.watchId;
+        }
+        if (mutating)
+        {
+            request.flags |= KSWORD_ARK_HVM_EPT_RULE_FLAG_UI_CONFIRMED;
+            request.confirmationToken =
+                KSWORD_ARK_HVM_CONTROL_CONFIRMATION_TOKEN;
+        }
+
+        result.io = deviceIoControl(
+            IOCTL_KSWORD_ARK_HVM_EPT_RULE,
+            &request,
+            sizeof(request),
+            &result.response,
+            sizeof(result.response));
+        result.unsupported = !result.io.ok &&
+            isUnsupportedHvmError(result.io.win32Error);
+        result.io.ntStatus = result.response.lastStatus;
+
+        std::ostringstream stream;
+        stream << "HVM watch operation=" << watch.operation
+            << ", status=" << result.response.status
+            << ", watchId=" << result.response.ruleId
+            << ", rows=" << result.response.returnedWatchRows
+            << ", page=0x" << std::hex << watch.physicalPage << std::dec;
+        if (result.unsupported)
+        {
+            stream << ", unsupported=true";
+        }
+        result.io.message = stream.str();
+        return result;
+    }
+
     HvmEventResult DriverClient::queryHvmEvents(
         const std::uint64_t afterSequence,
         const unsigned long maxRows,
@@ -493,6 +570,42 @@ namespace ksword::ark
             << ", status=" << result.response.status
             << ", rows=" << result.response.returnedRows
             << ", gla=0x" << std::hex << guestLinearAddress << std::dec;
+        if (result.unsupported)
+        {
+            stream << ", unsupported=true";
+        }
+        result.io.message = stream.str();
+        return result;
+    }
+
+    HvmProcessResult DriverClient::resolveHvmDirectoryBase(
+        const std::uint64_t directoryBase) const
+    {
+        HvmProcessResult result{};
+        KSWORD_ARK_HVM_PROCESS_REQUEST request{};
+        // 这个 IOCTL 有**自己的**协议版本号，不是通用的那个。
+        request.version = KSWORD_ARK_HVM_PROCESS_PROTOCOL_VERSION;
+        request.size = sizeof(request);
+        request.operation = KSWORD_ARK_HVM_PROCESS_OP_RESOLVE_CR3;
+        // 只填这一条操作自己的字段。驱动侧对 processId 与 gla 有"必须为空"的
+        // 契约：带了值就说明调用方把它当成了处置请求，整条被判参数非法。
+        request.directoryBase = directoryBase;
+
+        result.io = deviceIoControl(
+            IOCTL_KSWORD_ARK_HVM_PROCESS,
+            &request,
+            sizeof(request),
+            &result.response,
+            sizeof(result.response));
+        result.unsupported = !result.io.ok &&
+            isUnsupportedHvmError(result.io.win32Error);
+        result.io.ntStatus = result.response.lastStatus;
+
+        std::ostringstream stream;
+        stream << "HVM resolve cr3=0x" << std::hex << directoryBase << std::dec
+            << ", status=" << result.response.status
+            << ", pid=" << result.response.resolvedProcessId
+            << ", scanned=" << result.response.resolvedScannedProcesses;
         if (result.unsupported)
         {
             stream << ", unsupported=true";

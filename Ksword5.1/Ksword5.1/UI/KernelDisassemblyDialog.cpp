@@ -2,6 +2,8 @@
 
 #include "../ArkDriverClient/ArkDriverClient.h"
 #include "../theme.h"
+/* 统一入口：这一页不需要知道 GPA、EPT 叶或 ruleId。 */
+#include "KvmWatchDialog.h"
 #include "VisibleTableWidget.h"
 
 #include <QAbstractItemView>
@@ -845,6 +847,18 @@ namespace ks::ui
                     QStringLiteral("复制地址"));
                 QAction* copyBytes = menu.addAction(
                     QStringLiteral("复制原始字节"));
+                /*
+                 * 监视执行，而不是监视写。
+                 *
+                 * 在反汇编页选中的是一条**指令**，用户想知道的是"下一次谁执行
+                 * 到这里"。监视写在这里几乎总是错的：代码页平时没人写它，
+                 * 装上去只会永远等不到命中。
+                 */
+                menu.addSeparator();
+                QAction* watchExecute = menu.addAction(
+                    QStringLiteral("HVM 监视：下一次执行到这里"));
+                watchExecute->setToolTip(
+                    QStringLiteral("装一条首次访问监视，等下一次有人执行这一页时记下现场。EPT 是页粒度，所以实际监视的是这条指令所在的整个 4 KiB 页。"));
                 QAction* modify = nullptr;
                 if (m_kernelMutationEnabled)
                 {
@@ -865,6 +879,26 @@ namespace ks::ui
                 {
                     QApplication::clipboard()->setText(
                         bytesText(selection->originalBytes));
+                }
+                else if (selected == watchExecute)
+                {
+                    HvmWatchRequest request;
+                    request.virtualAddress = true;
+                    request.address = selection->address;
+                    /*
+                     * 长度取这条指令的字节数，而不是整页。
+                     *
+                     * 它不改变硬件监视的范围，只让命中之后能回答"落在你选的
+                     * 这条指令上，还是同一页的别处" —— 而在一个满是代码的页上，
+                     * 这个区别几乎决定了证据有没有用。
+                     */
+                    request.length = selection->originalBytes.isEmpty()
+                        ? 1U
+                        : static_cast<quint64>(selection->originalBytes.size());
+                    request.access = KSWORD_ARK_HVM_EPT_ACCESS_EXECUTE;
+                    request.label = QStringLiteral("%1 处的指令")
+                        .arg(addressText(selection->address));
+                    openHvmWatch(this, request);
                 }
                 else if (modify != nullptr
                     && selected == modify)
